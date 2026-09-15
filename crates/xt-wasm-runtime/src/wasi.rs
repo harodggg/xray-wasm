@@ -79,6 +79,35 @@ fn wasi_err(e: impl std::fmt::Debug) -> io::Error {
 ///
 /// 做法与 `wstd` 内部 `AsyncInputStream::poll_ready` 一致：把 pollable 的 waker
 /// 注册到当前任务，就绪时由 reactor 唤醒。
+/// 诊断用：存活中的 `WaitFor` 注册数、以及创建过的 `AsyncPollable` 数。
+///
+/// 目的只有一个：挂起期间这个数是不是**单调增长不回落**。
+/// 若是，就是 waker 注册泄漏 —— reactor 里留着失效 waker，
+/// `poll_oneoff` 每轮立刻返回 ⇒ 忙等（V24 的自旋）。
+static LIVE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MADE_POLLABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READY_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 给 `WaitFor` 包一层，好在它真的被 Drop 时把存活数减回去。
+struct CountedWait(Pin<Box<WaitFor>>);
+
+impl std::ops::Deref for CountedWait {
+    type Target = Pin<Box<WaitFor>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for CountedWait {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for CountedWait {
+    fn drop(&mut self) {
+        LIVE_WAITS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct Ready {
     pollable: OnceLock<AsyncPollable>,
     wait: Mutex<Option<Pin<Box<WaitFor>>>>,

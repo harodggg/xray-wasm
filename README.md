@@ -103,7 +103,7 @@ xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid>
 ```
 xray-wasm/
   crates/
-    xt-wasm-runtime/   shim 类型 + 非阻塞 socket 反应堆 + executor
+    xt-wasm-runtime/   shim 类型 + 平台 socket 层（wasm 直连 wasi:sockets / 宿主用 std）+ 事件循环
     xt-wasm-tls/       手写 TLS 1.3 + REALITY 客户端（移植自 meow-rs）
     xt-wasm-vless/     VLESS 请求头 + XTLS-Vision 流控（移植自 meow-rs）
     xt-wasm-cli/       SOCKS5 服务端 + 转发核心 + 入口
@@ -139,7 +139,7 @@ curl --proxy socks5h://…
 | **wasip2** 而不是 wasip1 | wasip1 的 `TcpStream::connect` 在 Rust 标准库里字面就是 `unsupported()`，**发不出站 TCP**。已实测，换运行时也救不了 |
 | **wasmtime 的四个 flag** | `-S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y -S inherit-env=y` **缺一不可**。缺 `inherit-network` 报 `PermissionDenied`（像被墙）；缺 `inherit-env` 则认证配置静默失效 |
 | **纯 Rust 手写 TLS** | REALITY 的认证藏在 ClientHello 的 `session_id` 里，需要字节级控制；`rustls` 不暴露该控制点。而 `boring`(BoringSSL) 是 C++，编译到 wasm 代价极高 |
-| **非阻塞 socket + 自研 executor** | wasip2 没有 tokio reactor，也没有线程。握手是顺序的（阻塞够用），但握手后的全双工转发必须读写同时存活，否则会死锁 |
+| **非阻塞 socket + 自研事件循环** | wasip2 没有 tokio reactor，也没有线程。socket 用 `wasi:sockets` 直连（非阻塞、pollable 就绪通知），事件循环用 Bytecode Alliance 的 `wstd` |
 | **不使用 ML-KEM** | 现代 Chrome 指纹走 X25519MLKEM768 混合交换，但已实测服务端**同样接受纯 X25519**（见 V7），省掉一整个依赖 |
 
 ---
@@ -158,27 +158,37 @@ curl --proxy socks5h://…
 
 | 限制 | 影响 | 说明 |
 |---|---|---|
-| **建连仍是阻塞的** | 服务端不可达时会短暂阻塞其它连接 | Rust 在 wasip2 上没给非阻塞 connect 的接口。同机/局域网毫秒级，仅影响建连这一小段；握手与转发全程非阻塞 |
-| **轮询式调度，无就绪通知** | 空闲时仍有周期性唤醒 | 没有接 `wasi:io/poll`。有连接时 1ms 轮询、空闲 10ms，是延迟与 CPU 的折中 |
 | **TLS 指纹非浏览器形状** | 功能可用，但抗 JA3/JA4 与主动探测弱于官方客户端 | 手写 ClientHello 未实现 uTLS 的 Chrome 伪装 |
 | **无 XTLS-Vision DIRECT splice** | 仅性能差异，不影响连通 | 功能路径完整 |
 | **无 UDP / Mux / 后量子** | QUIC / HTTP3 经此代理不可用 | ML-KEM、ML-DSA-65、`VlessPacketConn` 均未实现 |
 | **无 SOCKS5 UDP ASSOCIATE / BIND** | 仅支持 CONNECT | 对验证协议栈无增量价值 |
 
-### 并发
+> 宿主机构建（用于单元测试与本地调试）是**轮询式**的：宿主没有 pollable，
+> 只能「试 + 让出」。**wasm 才是产品**，它跑在真正的 reactor 上。
+> 所以宿主的 CPU 占用不代表线上表现。
 
-wasip2 没有线程，但**支持非阻塞 socket**，因此实现为**单线程多路复用**：
-所有连接作为 future 放在一个集合里统一推进，谁有数据就推进谁。
-并发上限 64（`MAX_CONCURRENT_CONNS`），超出后暂停 accept，新连接留在内核 backlog。
+### 并发与事件循环
 
-一条 keep-alive 长连接**不会**再独占代理。这一点有 A/B 对照实测：
+wasip2 没有线程，但支持非阻塞 socket。实现为**单线程协作式并发**：
+主循环只 accept，每条连接交给事件循环；socket 是非阻塞的，
+**挂起与唤醒由 pollable 完成**（`wasi:io/poll`），不是轮询。
+并发上限 64（`MAX_CONCURRENT_CONNS`），满了会等槽位而不是丢弃连接。
+
+一条 keep-alive 长连接**不会**独占代理。A/B 对照实测：
 
 | 实现 | 长连接占用期间的新请求 |
 |---|---|
-| 顺序 accept（修复前） | **超时失败，12s** |
-| 非阻塞多路复用（现在） | **HTTP 200，1s** |
+| v0.1 顺序 accept | **超时失败，12s** |
+| v0.2 起（非阻塞并发） | **HTTP 200，1s** |
 
-详见 [`docs/verification-log.md`](docs/verification-log.md) V16。
+去轮询的效果（30 秒空闲 CPU，两点法扣除 JIT 启动）：
+
+| 版本 | 空闲 CPU |
+|---|---|
+| v0.2（1ms 轮询） | **0.233s**（约 0.78%） |
+| v0.3（reactor 就绪通知） | **0.014s**（约 0.05%） |
+
+详见 [`docs/verification-log.md`](docs/verification-log.md) 的 V16 / V17。
 
 ---
 

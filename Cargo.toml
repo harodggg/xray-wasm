@@ -37,6 +37,10 @@ thiserror = "1"
 tracing = "0.1"
 async-trait = "0.1"
 
+# WASI 0.2 的异步标准库（Bytecode Alliance 官方）：提供原始 wasi:sockets
+# 访问、基于 pollable 的事件循环与定时器。**仅 wasm 目标使用。**
+wstd = "0.6"
+
 # ── 内部 crate ──────────────────────────────────────────────────
 xt-wasm-runtime = { path = "crates/xt-wasm-runtime" }
 xt-wasm-tls = { path = "crates/xt-wasm-tls" }

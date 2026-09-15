@@ -444,3 +444,81 @@ REALITY 握手本身及之后的全过程都是非阻塞的，影响仅限建连
 ./scripts/gen-test-server.sh && . .test-server/params.env
 XW_XRAY_DIR=$PWD/.test-server ./scripts/e2e-test.sh   # 第 7 步即并发用例
 ```
+
+---
+
+## V17 · 换掉 `std::net`：非阻塞 connect + 真就绪通知
+
+### 问题（V16 遗留的两条）
+
+V16 把并发做出来了，但底层仍有两个硬伤，**根因是同一个**：Rust 在 wasip2 上的
+`std::net` 只能阻塞，且不暴露底下的 WASI 资源。
+
+| 问题 | 后果 |
+|---|---|
+| 没有非阻塞 connect | 「连服务端」这一步会阻塞整个事件循环；服务端不可达时卡到 TCP 超时 |
+| 拿不到 pollable | 等数据只能「轮询 + 让出」（1ms），空闲时也在周期性唤醒 |
+
+### 方向选择
+
+两个问题都要绕开 `std::net`、直接用 `wasi:sockets`。先确认现成积木：
+
+| 方案 | 结论 |
+|---|---|
+| `wstd` v0.6.8（Bytecode Alliance 官方） | ✅ 采用。提供事件循环、pollable 封装、定时器，且把原始 `wasip2` 绑定透出来 |
+| `async-wasi` v0.2.1 | ❌ 绑定 WasmEdge，运行时不对 |
+| 手写 wit-bindgen 绑定 | ❌ 不必要，`wstd` 已提供 |
+
+**与协议层的边界**：`wstd` 的 `AsyncRead`/`AsyncWrite` 是 `async fn` 式的，
+而移植过来的 TLS/VLESS/Vision 用的是 tokio 的 **poll 式** trait。
+实测确认可以在原始 `wasi:sockets` 流上实现 poll 式 trait（`poll_*` 里非阻塞读，
+遇 `would-block` 就把 pollable 的 waker 注册到当前任务），
+**因此协议层一行未改** —— 换掉的只是最底下的 socket 层。
+
+### 前提验证（都实测过）
+
+| 前提 | 结果 |
+|---|---|
+| `wstd` 在 wasmtime + 我们的 flag 下可用 | ✅ 异步 connect/write/read/bind 全部成功 |
+| 能否在原始 wasip2 流上实现 poll 式 trait | ✅ spike 跑通，且观测到 `poll_read: Pending` → 被 reactor 唤醒（真就绪，非轮询） |
+| `NetStream` 是否满足 `Stream` 的 `Send + Sync` | ✅ 编译期静态断言通过 |
+
+### 实现中撞到的两个 WASI 资源语义坑
+
+都是 spike 阶段暴露的，两个都会让程序**看起来能跑但退出时报错**：
+
+1. **必须持有 `TcpSocket`**。它派生出的 `input`/`output` 流在父资源被 drop 后会失效。
+2. **字段顺序决定 drop 顺序**，而 WASI 要求**子资源先于父资源**释放，
+   否则组件模型报 `resource has children`。正确顺序：
+   `pollable → input/output 流 → socket`。
+
+### 效果（可量化）
+
+**item 3 —— 空闲 CPU。** 用两点法测（3s 短跑与 33s 长跑之差 = 30 秒空闲开销），
+以扣除 wasmtime 的 JIT 启动成本：
+
+| 版本 | 3s 启动 | 33s | **30 秒空闲 CPU** |
+|---|---|---|---|
+| v0.2.0（1ms 轮询） | 0.281s | 0.514s | **0.233s**（约 0.78%） |
+| v0.3.0（reactor 就绪） | 0.237s | 0.251s | **0.014s**（约 0.05%） |
+
+**降低约 17 倍。** 这说明轮询确实去掉了 —— 空闲时进程阻塞在 pollable 上，不消耗 CPU。
+
+**item 2 —— 非阻塞 connect。** 代码上从
+`TcpStream::connect()`（阻塞）换成 `start_connect()` + pollable 等待；
+`connect` 现在是 `async fn`，不再阻塞事件循环。
+
+> 坦白说明：这一项的**端到端可观测收益难以构造独立实验** ——
+> 所有连接都指向同一个服务端地址，所以「一个 connect 卡住而其它连接仍工作」
+> 的场景需要两个不同的服务端地址才能演示。这里给出的是代码层证据（调用的是
+> 非阻塞原语）与结构上的论证，不是像 item 3 那样的测量数据。
+
+### 回归验证
+
+换掉整个 socket 层之后：
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace` | **69 passed / 0 failed** |
+| `./scripts/e2e-test.sh` | **8/8 通过**（含并发、半开连接、两个认证负向用例） |
+| 协议层代码改动 | **0 行**（`xt-wasm-tls` / `xt-wasm-vless` 未动） |

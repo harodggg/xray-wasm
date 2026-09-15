@@ -10,3 +10,8 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+
+# 只有 wasm 目标需要：wasi:sockets 直连 + 基于 pollable 的事件循环。
+# 宿主构建走 std::net（见 src/host.rs），不引入 wstd。
+[target.'cfg(target_os = "wasi")'.dependencies]
+wstd = { workspace = true }

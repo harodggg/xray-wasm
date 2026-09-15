@@ -29,14 +29,12 @@
 mod relay;
 mod socks5;
 
-use std::future::Future;
-use std::io::ErrorKind;
-use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
-use std::pin::Pin;
-use std::task::{Context, Waker};
+use std::cell::Cell;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use xt_wasm_runtime::{block_on, NonBlockingStream, Stream};
+use xt_wasm_runtime::{block_on, sleep, spawn_task, timeout, NetStream, Stream};
 use xt_wasm_tls::{RealityConfig, RealityTlsLayer, TlsConfig, Transport};
 use xt_wasm_vless::{Cmd, VisionConn, VlessAddr, VlessConn};
 
@@ -365,21 +363,37 @@ fn main() {
     }
 }
 
+/// 各连接共享的配置。
+///
+/// `spawn_task` 要求 future 是 `'static`，所以配置不能靠借用传递，必须放进 `Rc`。
+/// wasm 是单线程，`Rc` 足够（`wstd::runtime::spawn` 也不要求 `Send`）。
+struct Shared {
+    server: String,
+    tls: TlsConfig,
+    uuid: [u8; 16],
+    socks_user: Option<String>,
+    socks_pass: Option<String>,
+    handshake_timeout_secs: u64,
+}
+
+impl Shared {
+    fn creds(&self) -> Option<socks5::Credentials<'_>> {
+        match (&self.socks_user, &self.socks_pass) {
+            (Some(u), Some(p)) => Some(socks5::Credentials {
+                username: u,
+                password: p,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// 建立一条到目标地址的隧道（REALITY → VLESS → Vision）。
 ///
-/// # 这里有一个残留的阻塞点
-///
-/// `xt_wasm_runtime::connect` 是阻塞的（Rust 在 wasip2 上没给非阻塞 connect 的接口），
-/// 所以「连服务端」这一步会短暂阻塞整个多路复用循环。通常很快（同机/局域网毫秒级），
-/// 但服务端不可达时会一直阻塞到 TCP 超时。REALITY 握手本身以及之后的全过程都是
-/// 非阻塞的，所以影响仅限建连这一小段。
-async fn open_tunnel(
-    args: &Args,
-    tls: &TlsConfig,
-    uuid: &[u8; 16],
-    host: &str,
-    port: u16,
-) -> Result<VisionConn, String> {
+/// 建连是**真异步**的：`connect` 内部走 `start_connect` + pollable，不会阻塞其它连接。
+/// （v0.2 及以前用的是 `std::net` 的阻塞 connect，服务端不可达时会把整个代理
+/// 卡到 TCP 超时。）
+async fn open_tunnel(shared: &Shared, host: &str, port: u16) -> Result<VisionConn, String> {
     // 域名保持域名形式交给服务端解析（socks5h 语义，也避免在 wasm 里做 DNS）。
     let addr = if let Ok(v4) = host.parse::<Ipv4Addr>() {
         VlessAddr::Ipv4(v4.octets())
@@ -389,64 +403,62 @@ async fn open_tunnel(
         VlessAddr::domain(host).map_err(|e| format!("目标地址非法：{e}"))?
     };
 
-    let sock = xt_wasm_runtime::connect(&args.server).map_err(|e| {
-        format!(
-            "连接服务端 {} 失败：{e}（wasmtime 需要 -S tcp=y -S inherit-network=y）",
-            args.server
-        )
-    })?;
+    let sock = xt_wasm_runtime::connect(&shared.server)
+        .await
+        .map_err(|e| {
+            format!(
+                "连接服务端 {} 失败：{e}（wasmtime 需要 -S tcp=y 和 -S inherit-network=y）",
+                shared.server
+            )
+        })?;
 
-    let layer = RealityTlsLayer::new(tls).map_err(|e| format!("构造 REALITY 层失败：{e}"))?;
+    let layer =
+        RealityTlsLayer::new(&shared.tls).map_err(|e| format!("构造 REALITY 层失败：{e}"))?;
     let tls_stream = layer
         .connect(Box::new(sock) as Box<dyn Stream>)
         .await
         .map_err(|e| format!("REALITY 握手失败：{e}"))?;
 
-    let vless = VlessConn::new_deferred(tls_stream, uuid, Some(VISION_FLOW), Cmd::Tcp, port, &addr)
-        .await
-        .map_err(|e| format!("VLESS 请求头发送失败：{e}"))?;
+    let vless = VlessConn::new_deferred(
+        tls_stream,
+        &shared.uuid,
+        Some(VISION_FLOW),
+        Cmd::Tcp,
+        port,
+        &addr,
+    )
+    .await
+    .map_err(|e| format!("VLESS 请求头发送失败：{e}"))?;
 
-    Ok(VisionConn::new(vless, *uuid))
+    Ok(VisionConn::new(vless, shared.uuid))
 }
 
 /// 同时处理的连接数上限。
 ///
 /// 有上限是必须的：内存与 fd 都有限，没有背压的话攻击者可以用一堆慢连接拖垮进程。
-/// 达到上限后暂停 accept，新连接留在内核 backlog 里。
 const MAX_CONCURRENT_CONNS: usize = 64;
 
-/// 多路复用循环的轮询间隔。
+/// SOCKS5 服务端。
 ///
-/// 没有真正的就绪通知（`wasi:io/poll` 是后续升级路径），只能用「轮询 + 让出」。
-/// 1ms 是延迟与空转 CPU 之间的折中，与 `xt-wasm-runtime` 的 executor 同一取舍。
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// 多路复用的 SOCKS5 服务端。
+/// # 并发模型
 ///
-/// # 为什么要多路复用
+/// 主循环只负责 accept，每条连接通过 [`spawn_task`] 交给事件循环。socket 是
+/// **非阻塞**的，等待由 pollable（wasm）或让出（宿主）完成 —— 所以一条
+/// keep-alive 长连接不会独占进程（v0.1 是顺序 accept，那会让 k8s 探针都超时）。
 ///
-/// wasip2 没有线程，早期实现是「accept 一条、处理到结束、再 accept 下一条」。
-/// 那样一条 keep-alive 长连接就会**独占整个进程**，其它客户端全部排队 ——
-/// 作为 k8s 共享出口代理基本不可用（k8s 的 TCP 探针也会因此超时）。
-///
-/// 现在所有连接都是非阻塞的，作为 future 放在一个集合里统一推进：
-/// 谁有数据就推进谁，谁在等就跳过谁。
+/// v0.2 曾用手写的「连接集合 + 每轮全量 poll + 1ms 让出」实现并发。v0.3 换成
+/// 真正的 reactor 之后那段代码删掉了：挂起与唤醒交给事件循环，不再需要轮询。
 fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
-    let uuid = decode_uuid(&args.uuid);
-    let listener = xt_wasm_runtime::listen(&args.listen).unwrap_or_else(|e| {
-        eprintln!("监听 {} 失败：{e}", args.listen);
-        std::process::exit(1)
+    let shared = Rc::new(Shared {
+        server: args.server.clone(),
+        tls: tls.clone(),
+        uuid: decode_uuid(&args.uuid),
+        socks_user: args.socks_user.clone(),
+        socks_pass: args.socks_pass.clone(),
+        handshake_timeout_secs: args.handshake_timeout_secs,
     });
-    // 非阻塞 accept：否则等待新连接时无法推进已有连接，多路复用就无从谈起。
-    if let Err(e) = listener.set_nonblocking(true) {
-        eprintln!("把监听切到非阻塞失败：{e}");
-        std::process::exit(1);
-    }
 
-    // 「绑了非回环地址 + 没有认证」= 开放代理：任何能连上该端口的人都能
-    // 免费用这条隧道出去。k8s 里做成 Service 之后尤其危险。这里必须显式告警，
-    // 因为这种配置看起来完全正常，出事之前没有任何症状。
-    let has_auth = args.socks_user.is_some();
+    let has_auth = shared.socks_user.is_some();
     if !is_loopback_listen(&args.listen) && !has_auth {
         eprintln!("──────────────────────────────────────────────────────────────");
         eprintln!(
@@ -458,7 +470,6 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
         eprintln!("      并配合网络策略限制来源。详见 README 的 k8s 一节。");
         eprintln!("──────────────────────────────────────────────────────────────");
     }
-
     println!(
         "[socks5] 监听 {}，隧道目标 {}，认证：{}，并发上限 {}",
         args.listen,
@@ -471,102 +482,61 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
         args.listen
     );
 
-    // 所有在途连接。它们是借用 args/tls/uuid 的 future，所以集合的生命周期受它们约束。
-    let mut conns: Vec<Pin<Box<dyn Future<Output = ()> + '_>>> = Vec::new();
-    // 不依赖唤醒（Pending 不保证有人来叫我们），所以用 noop waker。
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut at_capacity_reported = false;
+    let listen_addr = args.listen.clone();
+    let result = block_on(async move {
+        let listener = xt_wasm_runtime::listen(&listen_addr).await?;
+        // 在途连接计数：每个 spawn 出来的任务结束时自减。
+        let live = Rc::new(Cell::new(0usize));
 
-    loop {
-        // ── 1) 尽量接收新连接，直到并发上限 ──
-        while conns.len() < MAX_CONCURRENT_CONNS {
-            match listener.accept() {
-                Ok((sock, peer)) => {
-                    conns.push(Box::pin(serve_connection(sock, peer, args, tls, &uuid)));
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    eprintln!("[socks5] accept 失败：{e}");
-                    break;
-                }
+        loop {
+            let stream = listener.accept().await?;
+
+            // 满了就等一个槽位空出来，而不是直接丢弃 ——
+            // 直接关掉会让 k8s 探针失败并可能触发重启。
+            while live.get() >= MAX_CONCURRENT_CONNS {
+                sleep(Duration::from_millis(5)).await;
             }
-        }
-        if conns.len() >= MAX_CONCURRENT_CONNS {
-            if !at_capacity_reported {
-                eprintln!(
-                    "[socks5] 已达并发上限 {}，暂停接受新连接（新连接会留在内核 backlog）",
-                    MAX_CONCURRENT_CONNS
-                );
-                at_capacity_reported = true;
-            }
-        } else {
-            at_capacity_reported = false;
+            live.set(live.get() + 1);
+
+            let shared = Rc::clone(&shared);
+            let live_task = Rc::clone(&live);
+            spawn_task(async move {
+                serve_connection(stream, &shared).await;
+                live_task.set(live_task.get().saturating_sub(1));
+            });
         }
 
-        // ── 2) 推进所有在途连接，完成的移除 ──
-        let mut i = 0;
-        while i < conns.len() {
-            if conns[i].as_mut().poll(&mut cx).is_ready() {
-                // swap_remove 会把最后一个元素换到 i 位置，所以 i 不自增，
-                // 下一轮继续 poll 这个被换过来的元素。
-                drop(conns.swap_remove(i));
-            } else {
-                i += 1;
-            }
-        }
+        #[allow(unreachable_code)]
+        Ok::<(), std::io::Error>(())
+    });
 
-        // ── 3) 让出 ──
-        // 空闲时睡久一点（没有连接时没必要 1ms 醒一次），有在途连接时用轮询间隔。
-        if conns.is_empty() {
-            std::thread::sleep(Duration::from_millis(10));
-        } else {
-            std::thread::sleep(POLL_INTERVAL);
-        }
+    if let Err(e) = result {
+        eprintln!("[socks5] 致命错误：{e}");
+        std::process::exit(1);
     }
+    std::process::exit(0);
 }
 
-/// 处理一条连接，并把结果打成日志。作为 future 放进多路复用集合。
-async fn serve_connection(
-    local: TcpStream,
-    peer: std::net::SocketAddr,
-    args: &Args,
-    tls: &TlsConfig,
-    uuid: &[u8; 16],
-) {
-    match serve_inner(local, args, tls, uuid).await {
+/// 处理一条连接，并把结果打成日志。作为独立任务交给事件循环。
+async fn serve_connection(stream: NetStream, shared: &Shared) {
+    let peer = stream.peer_addr().unwrap_or_else(|_| "?".to_string());
+    match serve_inner(stream, shared).await {
         Ok((host, port)) => println!("[socks5] {peer} → {host}:{port} 完成"),
         Err(e) => eprintln!("[socks5] {peer} 失败：{e}"),
     }
 }
 
 /// 一条连接的完整生命周期：协商 → 建隧道 → 双向转发。
-async fn serve_inner(
-    local: TcpStream,
-    args: &Args,
-    tls: &TlsConfig,
-    uuid: &[u8; 16],
-) -> Result<(String, u16), String> {
-    // 协商也要跑在非阻塞 socket 上：由多路复用器推进，不能让它阻塞。
-    let mut local = NonBlockingStream::new(local).map_err(|e| format!("切换非阻塞失败：{e}"))?;
-
-    let creds = match (&args.socks_user, &args.socks_pass) {
-        (Some(u), Some(p)) => Some(socks5::Credentials {
-            username: u,
-            password: p,
-        }),
-        _ => None,
-    };
-
+async fn serve_inner(mut stream: NetStream, shared: &Shared) -> Result<(String, u16), String> {
     // **非阻塞读永远不会自己超时**，所以协商必须套一层墙钟超时。
-    // 没有它，一个「连上但不发数据」的客户端会永久占住一个并发槽位，
-    // 攒够 MAX_CONCURRENT_CONNS 个就把代理彻底堵死（k8s 探针、扫描器都会这么做）。
-    let req = xt_wasm_runtime::timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        socks5::negotiate_and_read_request(&mut local, creds),
+    // 没有它，一个「连上但不发数据」的客户端会长期占住一个并发槽位
+    // （k8s 探针、扫描器都会这么做）。
+    let req = timeout(
+        Duration::from_secs(shared.handshake_timeout_secs),
+        socks5::negotiate_and_read_request(&mut stream, shared.creds()),
     )
     .await
-    .map_err(|_| format!("SOCKS5 协商超时（{}s）", args.handshake_timeout_secs))?
+    .map_err(|_| format!("SOCKS5 协商超时（{}s）", shared.handshake_timeout_secs))?
     .map_err(|e| format!("SOCKS5 协商失败：{e}"))?;
 
     let (host, port) = match req {
@@ -578,20 +548,20 @@ async fn serve_inner(
         }
     };
 
-    let tunnel = match open_tunnel(args, tls, uuid, &host, port).await {
+    let tunnel = match open_tunnel(shared, &host, port).await {
         Ok(t) => t,
         Err(e) => {
             // 回一条失败应答，让客户端立刻知道，而不是干等超时。
-            let _ = socks5::write_reply_failure(&mut local).await;
+            let _ = socks5::write_reply_failure(&mut stream).await;
             return Err(e);
         }
     };
 
-    socks5::write_reply_ok(&mut local)
+    socks5::write_reply_ok(&mut stream)
         .await
         .map_err(|e| format!("回 SOCKS5 应答失败：{e}"))?;
 
-    relay::relay_bidirectional(Box::new(local), Box::new(tunnel))
+    relay::relay_bidirectional(Box::new(stream), Box::new(tunnel))
         .await
         .map_err(|e| format!("转发失败：{e}"))?;
 
@@ -615,22 +585,28 @@ fn run_self_test(args: &Args, tls: &TlsConfig) -> ! {
         }
     };
 
-    let sock = match xt_wasm_runtime::connect(&args.server) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[self-test] TCP 连接失败：{e}");
-            eprintln!("  提示：wasmtime 需要 -S tcp=y 和 -S inherit-network=y");
-            std::process::exit(1);
+    // 整个流程放进一个 async 块：`connect` 现在是异步的（非阻塞 connect +
+    // pollable 等待），不能再像以前那样先同步连上再 block_on 握手。
+    let server = args.server.clone();
+    let outcome = block_on(async move {
+        let t0 = Instant::now();
+        let sock = match xt_wasm_runtime::connect(&server).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!(
+                    "TCP 连接失败：{e}\n  提示：wasmtime 需要 -S tcp=y 和 -S inherit-network=y"
+                ))
+            }
+        };
+        println!("[self-test] TCP 已连接");
+        match layer.connect(Box::new(sock) as Box<dyn Stream>).await {
+            Ok(_) => Ok(t0.elapsed()),
+            Err(e) => Err(format!("REALITY 握手失败（{:?}）：{e}", t0.elapsed())),
         }
-    };
-    println!("[self-test] TCP 已连接");
+    });
 
-    let t0 = Instant::now();
-    let result = block_on(layer.connect(Box::new(sock) as Box<dyn Stream>));
-    let elapsed = t0.elapsed();
-
-    match result {
-        Ok(_stream) => {
+    match outcome {
+        Ok(elapsed) => {
             println!("[self-test] ✓ REALITY 握手完成，用时 {elapsed:?}");
             println!(
                 "[self-test] 现在去服务端日志里确认 isHandshakeComplete=true 与 ClientShortId"
@@ -638,7 +614,7 @@ fn run_self_test(args: &Args, tls: &TlsConfig) -> ! {
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("[self-test] ✗ REALITY 握手失败（{elapsed:?}）：{e}");
+            eprintln!("[self-test] ✗ {e}");
             std::process::exit(1);
         }
     }

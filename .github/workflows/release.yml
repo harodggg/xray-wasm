@@ -17,6 +17,11 @@ on:
         description: '手动发布时使用的 tag（例如 v0.1.0）'
         required: true
 
+# 创建 Release 需要 contents: write；推镜像需要 packages: write（在 image job 上单独声明）。
+# 很多仓库的默认 token 权限是只读，不显式声明的话 action-gh-release 会 403。
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # 与 ci.yml 同理：CARGO_* 与 XW_* 必须指向同一处，否则缓存静默失效。
@@ -62,6 +67,8 @@ jobs:
     name: 构建 wasm 包
     runs-on: ubuntu-latest
     needs: verify
+    permissions:
+      contents: write   # 创建 Release 需要
     outputs:
       sha256: ${{ steps.hash.outputs.sha256 }}
     steps:

@@ -12,6 +12,15 @@
 /.e2e-client.log
 /.e2e-hold.log
 
+# 服务端方向的端到端（scripts/e2e-server-test.sh）。
+# 其中 .e2e-srv-*.json 是**现场生成的客户端配置，里面有 shortId 与 UUID**
+# （每次运行都不一样，但仍然是凭据）—— 一律不入库。
+/.e2e-srv-wasm.log
+/.e2e-srv-client.log
+/.e2e-srv-client.json
+/.e2e-srv-bad.log
+/.e2e-srv-bad.json
+
 # gen-test-server.sh 生成的一次性测试服务端（含私钥，绝不入库）
 /.test-server/
 

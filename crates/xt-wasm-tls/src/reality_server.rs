@@ -452,9 +452,12 @@ pub async fn reality_server_handshake(
     cfg: &RealityServerConfig,
 ) -> Result<HandshakeOutcome> {
     // ── 1) 读第一条记录：ClientHello（明文）──
-    let record = read_record(&mut inner).await?.ok_or_else(|| {
-        TransportError::Tls("Reality server: 还没读到 ClientHello 连接就断了".into())
-    })?;
+    //
+    // 干净 EOF（对端一个字节没发就关）是**独立类型**而不是 TLS 错误：
+    // 公网端口上这是最频繁的事件（探针、扫描器），调用方需要把它静音处理。
+    let record = read_record(&mut inner)
+        .await?
+        .ok_or(TransportError::EmptyConnection)?;
 
     // 认证失败时要原样转发，所以先把原始字节留一份（含 5 字节 record 头）。
     let mut buffered = record.header.to_vec();

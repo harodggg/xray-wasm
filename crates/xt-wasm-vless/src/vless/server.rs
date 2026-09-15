@@ -162,7 +162,8 @@ fn parse_flow_addon(addon: &[u8]) -> Result<Option<String>> {
 use tokio::io::AsyncWriteExt;
 use xt_wasm_runtime::{connect, relay_bidirectional, Stream};
 use xt_wasm_tls::{reality_server_handshake, HandshakeOutcome, RealityServerConfig};
-
+// `TransportError` 由 xt-wasm-tls 转出（它就是 xt-wasm-runtime 的那一个类型）。
+use xt_wasm_tls::TransportError;
 /// 入站配置。
 #[derive(Debug, Clone)]
 pub struct InboundConfig {
@@ -180,6 +181,28 @@ pub enum InboundOutcome {
     Forwarded { target: String },
     /// 未通过认证，已转发到 dest（探测者看到的是一次普通访问）
     FellBack,
+    /// 对端连上后一个字节没发就关了。
+    ///
+    /// 这**不是失败**：k8s 的 `tcpSocket` 探针、端口扫描器、LB 健康检查
+    /// 都长这样，而且是公网端口上最频繁的事件。单独成一类，
+    /// 调用方才能对它静音，不至于让探针淹没真正的错误。
+    EmptyConnection,
+}
+
+/// 连接**刚做出判定**时发出的事件，早于任何字节被转发。
+///
+/// 为什么需要它：`InboundOutcome` 要等整条连接结束（长连接可能几小时）才返回，
+/// 只靠它会得到一个「连接断开时才知道曾经连上过」的日志 —— 运维上没用，
+/// 测试里也只能靠 sleep 猜时机。服务端必须能在连接**建立的当下**说话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundEvent {
+    /// REALITY 认证通过、VLESS 请求头解析完成，即将连接 `target`。
+    ///
+    /// 注意措辞是「即将连接」：`target` 能否连通还不一定，
+    /// 连不上会在随后以一个 `Err` 结束。
+    Authenticated { user: [u8; 16], target: String },
+    /// 未通过 REALITY 认证，按陌生流量原样转发到 `dest`。
+    Fallback { server_name: Option<String> },
 }
 
 fn to_meow(e: xt_wasm_tls::TransportError) -> MeowError {
@@ -196,11 +219,37 @@ fn addr_to_target(addr: &VlessAddr, port: u16) -> String {
 }
 
 /// 处理一条入站连接直到转发结束。
+///
+/// 想在连接**建立时**就记一笔日志/指标，用 [`serve_inbound_with_events`]。
 pub async fn serve_inbound(stream: Box<dyn Stream>, cfg: &InboundConfig) -> Result<InboundOutcome> {
-    match reality_server_handshake(stream, &cfg.reality)
-        .await
-        .map_err(to_meow)?
-    {
+    serve_inbound_with_events(stream, cfg, |_| {}).await
+}
+
+/// 同 [`serve_inbound`]，但在做出判定的当下回调 `on_event`。
+///
+/// 回调在**转发任何字节之前**被调用，所以：
+/// * 它可以安全地打日志 —— 此时连接已经确定归属，但还没开始搬数据；
+/// * 它不能阻塞（整个 future 是单线程跑的），别在里面做 IO。
+pub async fn serve_inbound_with_events<F>(
+    stream: Box<dyn Stream>,
+    cfg: &InboundConfig,
+    mut on_event: F,
+) -> Result<InboundOutcome>
+where
+    F: FnMut(InboundEvent),
+{
+    let handshake = match reality_server_handshake(stream, &cfg.reality).await {
+        Ok(h) => h,
+        // 空连接在这里就终结：不当作错误往上抛。
+        // 抛成 Err 的话，每个调用方都得去字符串匹配「是不是那个 EOF」才能静音，
+        // 而总有人会忘 —— 于是 k8s 探针每 10 秒刷一条错误日志。
+        Err(TransportError::EmptyConnection) => {
+            return Ok(InboundOutcome::EmptyConnection);
+        }
+        Err(e) => return Err(to_meow(e)),
+    };
+
+    match handshake {
         HandshakeOutcome::Authenticated { mut stream, .. } => {
             let req = decode_request(&mut stream).await?;
 
@@ -228,6 +277,11 @@ pub async fn serve_inbound(stream: Box<dyn Stream>, cfg: &InboundConfig) -> Resu
             }
 
             let target = addr_to_target(&req.addr, req.port);
+            on_event(InboundEvent::Authenticated {
+                user: req.user_id,
+                target: target.clone(),
+            });
+
             let outbound = connect(&target)
                 .await
                 .map_err(|e| MeowError::Proxy(format!("连接目标 {target} 失败：{e}")))?;
@@ -245,8 +299,12 @@ pub async fn serve_inbound(stream: Box<dyn Stream>, cfg: &InboundConfig) -> Resu
         }
 
         HandshakeOutcome::Fallback {
-            stream, buffered, ..
+            stream,
+            buffered,
+            server_name,
         } => {
+            on_event(InboundEvent::Fallback { server_name });
+
             let mut outbound = connect(&cfg.dest)
                 .await
                 .map_err(|e| MeowError::Proxy(format!("连接 dest {} 失败：{e}", cfg.dest)))?;
@@ -360,6 +418,227 @@ mod tests {
                 InboundOutcome::Forwarded { .. }
             ),
             "授权客户端应当走转发路径"
+        );
+    }
+
+    /// 事件必须在**转发完成之前**发出。
+    ///
+    /// 这条用例不是在测「事件能不能发」——那太弱了——而是在测发生时序。
+    /// 关键在于**客户端全程不读回包**，只是等事件出现：
+    /// 如果事件是转发结束后才发的，双向转发会一直卡着，事件永远不出现，
+    /// 这里就会超时失败。而这正是「服务端日志有没有用」的分界线 ——
+    /// 长连接上，事后才写的日志等于没有日志。
+    ///
+    /// 注意不能断言「客户端写入返回时事件已就绪」：`tokio::io::duplex` 是内存管道，
+    /// 写入会先落进缓冲区，服务端甚至还没被 poll 到。
+    #[test]
+    fn inbound_emits_authenticated_event_before_relaying() {
+        use crate::vless::{Cmd, VlessAddr, VlessConn};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xt_wasm_runtime::{block_on, yield_now};
+        use xt_wasm_tls::{reality_handshake, RealityConfig, RealityServerConfig};
+
+        const SNI: &str = "www.cloudflare.com";
+        const SHORT_ID: [u8; 8] = [2, 3, 4, 5, 6, 7, 8, 9];
+        let uuid = [0x22u8; 16];
+        let echo = spawn_echo();
+
+        let server_priv = xt_wasm_tls::test_support::fixture_private_key();
+        let server_pub = xt_wasm_tls::test_support::public_from_private(&server_priv);
+        let inbound = InboundConfig {
+            reality: RealityServerConfig {
+                private_key: server_priv,
+                short_ids: vec![SHORT_ID],
+                server_names: vec![SNI.to_string()],
+                max_time_diff_secs: 60,
+            },
+            dest: "127.0.0.1:9".to_string(),
+            users: vec![uuid],
+        };
+
+        let events: Rc<RefCell<Vec<InboundEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_srv = Rc::clone(&events);
+        let events_cli = Rc::clone(&events);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let echo_port = echo.port();
+
+        block_on(async {
+            let server = serve_inbound_with_events(Box::new(server_io), &inbound, move |ev| {
+                events_srv.borrow_mut().push(ev)
+            });
+            let client = async {
+                let tls = reality_handshake(
+                    Box::new(client_io),
+                    SNI,
+                    &[],
+                    &RealityConfig {
+                        public_key: server_pub,
+                        short_id: SHORT_ID,
+                        client_version: [26, 3, 27],
+                    },
+                )
+                .await
+                .expect("客户端握手");
+                let mut vless = VlessConn::new_deferred(
+                    Box::new(tls),
+                    &uuid,
+                    None,
+                    Cmd::Tcp,
+                    echo_port,
+                    &VlessAddr::Ipv4([127, 0, 0, 1]),
+                )
+                .await
+                .expect("VLESS 请求头");
+
+                vless.write_all(b"x").await.expect("写");
+                vless.flush().await.expect("flush");
+
+                // 只等事件，**不读回包**：转发此刻仍卡在半途。
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while events_cli.borrow().is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "超时：事件只在转发结束后才发出，长连接下日志就等于没有"
+                    );
+                    yield_now().await;
+                }
+                assert_eq!(
+                    events_cli.borrow().clone(),
+                    vec![InboundEvent::Authenticated {
+                        user: uuid,
+                        target: format!("127.0.0.1:{echo_port}"),
+                    }],
+                );
+
+                let mut buf = [0u8; 8];
+                let n = vless.read(&mut buf).await.expect("读");
+                assert_eq!(&buf[..n], b"x");
+            };
+            let (outcome, ()) = futures::join!(server, client);
+            assert!(matches!(
+                outcome.expect("入站不应报错"),
+                InboundOutcome::Forwarded { .. }
+            ));
+        });
+    }
+
+    /// 未认证的连接也要发事件 —— 回退是正常路径，不是错误路径，
+    /// 日志里必须能看见它（否则探测流量会完全静默）。
+    #[test]
+    fn inbound_emits_fallback_event_for_unauthenticated_client() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        use xt_wasm_runtime::block_on;
+        use xt_wasm_tls::{reality_handshake, RealityConfig, RealityServerConfig};
+
+        const SNI: &str = "www.cloudflare.com";
+        let echo = spawn_echo(); // 充作 dest
+        let server_priv = xt_wasm_tls::test_support::fixture_private_key();
+        let server_pub = xt_wasm_tls::test_support::public_from_private(&server_priv);
+
+        let inbound = InboundConfig {
+            reality: RealityServerConfig {
+                private_key: server_priv,
+                short_ids: vec![[9u8; 8]],
+                server_names: vec![SNI.to_string()],
+                max_time_diff_secs: 60,
+            },
+            dest: format!("127.0.0.1:{}", echo.port()),
+            users: vec![[0x33u8; 16]],
+        };
+        // shortId 故意写错 → REALITY 认证必然失败 → 走回退
+        let bad_client = RealityConfig {
+            public_key: server_pub,
+            short_id: [0xAAu8; 8],
+            client_version: [26, 3, 27],
+        };
+
+        let events: Rc<RefCell<Vec<InboundEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_srv = Rc::clone(&events);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        block_on(async {
+            let server = serve_inbound_with_events(Box::new(server_io), &inbound, move |ev| {
+                events_srv.borrow_mut().push(ev)
+            });
+            let client = async {
+                // 认证失败后，我们要把 TLS 客户端握手的客户端 hello 原样送给 dest（echo）。
+                // echo 只会回显后关闭，所以这里必然失败 —— 这正是「探测者拿不到
+                // 一个可用隧道」的表现。用 timeout 兜底，避免等一个永远不会来的 ServerHello。
+                let _ = xt_wasm_runtime::timeout(
+                    Duration::from_secs(2),
+                    reality_handshake(Box::new(client_io), SNI, &[], &bad_client),
+                )
+                .await;
+            };
+            let (outcome, ()) = futures::join!(server, client);
+            assert!(
+                matches!(
+                    outcome.expect("回退路径本身不应报错"),
+                    InboundOutcome::FellBack
+                ),
+                "认证失败必须走 FellBack"
+            );
+        });
+
+        let seen = events.borrow().clone();
+        assert_eq!(
+            seen,
+            vec![InboundEvent::Fallback {
+                server_name: Some(SNI.to_string()),
+            }],
+            "回退也要发事件"
+        );
+    }
+
+    /// 空连接必须是 **Ok(EmptyConnection)**，不是 Err。
+    ///
+    /// 这条用例看着琐碎，但它守着一个运维后果：k8s 的 `tcpSocket` 探针、
+    /// 端口扫描器、LB 健康检查全是「连上就关」。如果这里返回 Err，
+    /// 服务端就必然把它们记成失败 —— 每 10 秒一行错误日志，真正的故障被淹掉。
+    /// 而且调用方只能靠字符串匹配来静音，总有实现会忘。
+    #[test]
+    fn empty_connection_is_an_outcome_not_an_error() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use xt_wasm_runtime::block_on;
+        use xt_wasm_tls::RealityServerConfig;
+
+        let inbound = InboundConfig {
+            reality: RealityServerConfig {
+                private_key: xt_wasm_tls::test_support::fixture_private_key(),
+                short_ids: vec![[5u8; 8]],
+                server_names: vec!["www.cloudflare.com".to_string()],
+                max_time_diff_secs: 60,
+            },
+            dest: "127.0.0.1:9".to_string(),
+            users: vec![[0x44u8; 16]],
+        };
+
+        let events: Rc<RefCell<Vec<InboundEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_srv = Rc::clone(&events);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let outcome = block_on(async move {
+            // 客户端一个字节都不发，直接断开
+            drop(client_io);
+            serve_inbound_with_events(Box::new(server_io), &inbound, move |ev| {
+                events_srv.borrow_mut().push(ev)
+            })
+            .await
+        });
+
+        assert_eq!(
+            outcome.expect("空连接不该是 Err"),
+            InboundOutcome::EmptyConnection
+        );
+        assert!(
+            events.borrow().is_empty(),
+            "空连接不该产生认证/回退事件（那两行日志表示真的有人在用）"
         );
     }
 

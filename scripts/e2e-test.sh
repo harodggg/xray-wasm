@@ -69,7 +69,7 @@ else
         fail "服务端启动失败"
     }
     # 注意：必须写 ${SERVER_PID}。紧跟在变量名后面的全角括号是多字节字符，
-    # bash 会把它当成变量名的一部分（$SERVER_PID）→ 「unbound variable」。
+    # bash 会把它当成变量名的一部分（${SERVER_PID}）→ 「unbound variable」。
     pass "已启动服务端（pid ${SERVER_PID}）"
 fi
 
@@ -125,7 +125,7 @@ STALL_PID=$!
 sleep 4   # 超过协商超时，代理应已丢弃这条半开连接
 CODE=$(proxy_curl -o /dev/null -w '%{http_code}' https://example.com 2>&1) || CODE='000'
 kill "$STALL_PID" 2>/dev/null || true
-[ "$CODE" = "200" ] || fail "半开连接之后代理未能恢复（拿到 $CODE）—— 顺序 accept 被卡死了"
+[ "$CODE" = "200" ] || fail "半开连接之后代理未能恢复（拿到 ${CODE}）—— 顺序 accept 被卡死了"
 pass "半开连接超时后被丢弃，代理已恢复"
 
 echo "==> 7/8 并发：一条长连接不得独占代理（多路复用是否真的生效）"
@@ -160,7 +160,7 @@ STILL_ALIVE=no
 kill -0 "$HOLD_PID" 2>/dev/null && STILL_ALIVE=yes
 kill "$HOLD_PID" 2>/dev/null || true
 wait "$HOLD_PID" 2>/dev/null || true
-[ "$CODE" = "200" ] || fail "长连接存在时新请求失败（拿到 $CODE）—— 代理被独占了"
+[ "$CODE" = "200" ] || fail "长连接存在时新请求失败（拿到 ${CODE}）—— 代理被独占了"
 [ "$STILL_ALIVE" = "yes" ] || fail "长连接在请求完成前已退出，无法证明并发"
 pass "长连接占用期间新请求仍成功（${ELAPSED}s，长连接全程存活）"
 

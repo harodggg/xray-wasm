@@ -71,6 +71,15 @@ pub enum TransportError {
 
     #[error("invalid config: {0}")]
     Config(String),
+
+    /// 对端连上后**一个字节都没发**就关了。
+    ///
+    /// 这不是协议错误，而是公网端口上最常见的事件：k8s 的 `tcpSocket` 探针、
+    /// 端口扫描器、负载均衡器的健康检查都会这样。必须是一个**独立类型**，
+    /// 上游才能把它和「握手真的失败了」区分开 —— 两者混为一谈的话，
+    /// 探针每 10 秒就刷一条错误日志，真正的故障反而被淹掉。
+    #[error("connection closed before any data was sent")]
+    EmptyConnection,
 }
 
 /// crate 级 `Result` 别名。

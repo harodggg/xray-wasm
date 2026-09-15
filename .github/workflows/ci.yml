@@ -126,3 +126,70 @@ jobs:
           cat .e2e-server.log 2>/dev/null || echo "(无)"
           echo "===== 客户端日志 ====="
           cat .e2e-client.log 2>/dev/null || echo "(无)"
+
+  # ── 真实端到端（反方向）：真实 Xray 客户端 → 我们的 wasm REALITY 服务端 → 外网 ──
+  #
+  # 与上一个 job 是镜像关系，两边都必须常态化跑：
+  # 「客户端能连上别人的服务端」和「我们的服务端能被别人的客户端连上」
+  # 是两组完全不同的实现，任何一侧的回归都不该靠另一侧兜住。
+  e2e-server:
+    name: 端到端（我们的 wasm REALITY 服务端）
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（含 wasm32-wasip2）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.XW_CARGO_HOME }}
+            ${{ env.XW_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # openssl 用来做「抗主动探测」那条用例：未认证的 TLS 探测者
+      # 必须看到 dest 的真实证书，而不是我们伪造的 Ed25519 证书。
+      - name: 安装 e2e 依赖（nc；python3 生成凭据；openssl 做探测）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends netcat-openbsd python3 openssl
+
+      - name: 下载 wasmtime
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/wasmtime.tar.xz \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          tar -xJf /tmp/wasmtime.tar.xz -C "$HOME"
+          echo "WASMTIME_BIN=$HOME/wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime" >> "$GITHUB_ENV"
+
+      - name: 下载 Xray-core（客户端基准）
+        run: |
+          set -eux
+          mkdir -p "$GITHUB_WORKSPACE/.xray"
+          curl -fsSL -o /tmp/xray.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_ASSET}"
+          unzip -q -o /tmp/xray.zip -d "$GITHUB_WORKSPACE/.xray"
+          chmod +x "$GITHUB_WORKSPACE/.xray/xray"
+          echo "XW_XRAY_BIN=$GITHUB_WORKSPACE/.xray/xray" >> "$GITHUB_ENV"
+
+      - name: 构建 wasm
+        run: cargo build -p xt-wasm-cli --release --target wasm32-wasip2
+
+      - name: 端到端（服务端方向）
+        run: ./scripts/e2e-server-test.sh
+
+      - name: 失败时输出日志
+        if: failure()
+        run: |
+          echo "===== wasm 服务端日志 ====="
+          cat .e2e-srv-wasm.log 2>/dev/null || echo "(无)"
+          echo "===== stock 客户端日志 ====="
+          cat .e2e-srv-client.log 2>/dev/null || echo "(无)"
+          echo "===== 错误 UUID 客户端日志 ====="
+          cat .e2e-srv-bad.log 2>/dev/null || echo "(无)"

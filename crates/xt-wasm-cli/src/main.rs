@@ -1,15 +1,22 @@
-//! xt-wasm-cli —— 在 wasmtime 下运行的代理客户端。
+//! xt-wasm-cli —— 在 wasmtime 下运行的代理，**客户端与服务端同一个二进制**。
 //!
-//! 两种模式：
+//! 三种模式：
 //!
+//! * `server` 子命令：REALITY **入站**（服务端）。给 k3s 用，见下。
 //! * `--self-test`：只做 REALITY 握手并报告结果。不依赖 VLESS 层，
 //!   用于 M1 验收（TLS 一落地就能对真实服务端验证）。
-//! * 默认：本地 SOCKS5 监听 → VLESS + XTLS-Vision + REALITY 隧道。
+//! * 默认（无子命令）：本地 SOCKS5 监听 → VLESS + XTLS-Vision + REALITY 隧道。
 //!
 //! ```sh
+//! # 客户端
 //! ./scripts/run-local.sh --server 127.0.0.1:8443 \
 //!     --pbk <公钥> --sid <shortId> --sni www.cloudflare.com \
 //!     --uuid <uuid> --listen 127.0.0.1:1080
+//!
+//! # 服务端（k3s）
+//! xt-wasm-cli server --listen 0.0.0.0:8443 --private-key <base64url> \
+//!     --short-ids <hex> --server-names www.example.com \
+//!     --dest www.example.com:443 --users <uuid>
 //! ```
 //!
 //! # 一次连接的完整链路
@@ -25,7 +32,12 @@
 //!
 //! 顺序与 port-map §4.3 一致。VLESS 请求头用 `new_deferred`（不在此刻等服务端应答），
 //! 应答在首次读时顺带处理。
+//!
+//! **服务端不实现 Vision（flow）**：客户端必须把 `flow` 留空。请求里带了非空 flow
+//! 时服务端会明确报 `NotSupported` 而不是默默降级 —— 静默降级会变成一类
+//! 「认证过了但数据流对不上」的偶发故障。
 
+mod server;
 mod socks5;
 
 use std::cell::Cell;
@@ -91,6 +103,38 @@ fn usage() -> ! {
 
 /// 把 ClientVer 三元组渲染成 `x.y.z`。
 ///
+/// `server` 子命令的帮助文本。
+pub fn usage_server() -> ! {
+    eprintln!(
+        "用法：
+  xt-wasm-cli server --private-key <base64url> --short-ids <hex[,hex...]>
+                     --server-names <域名[,域名...]> --dest <host:port>
+                     --users <uuid[,uuid...]> [--listen 0.0.0.0:8443]
+                     [--max-time-diff <秒>]
+
+这是 REALITY **入站**（服务端）。为 k3s 而写：所有参数都有对应环境变量，
+凭证可以只从 Secret 注入，不必出现在 Pod 的 args 里。
+
+必填：
+  --private-key / XT_PRIVATE_KEY   X25519 私钥（base64url）。`xray x25519` 生成，
+                                   注意用 Private key 那一行。
+  --short-ids   / XT_SHORT_IDS     shortId（hex，逗号分隔）。至少一个。
+  --server-names/ XT_SERVER_NAMES  允许的 SNI（逗号分隔）。客户端 SNI 必须命中其一。
+  --dest        / XT_DEST          认证失败时的回落目标 host:port。
+                                   应是一个**真实的 TLS 站点**，探测者会看到它的证书。
+  --users       / XT_USERS         允许的 VLESS UUID（逗号分隔）。至少一个。
+
+可选：
+  --listen      / XT_SERVER_LISTEN 监听地址（默认 0.0.0.0:8443）。
+  --max-time-diff / XT_MAX_TIME_DIFF
+                                   REALITY 时间戳容差秒数（默认 60）。两端时钟偏移超过
+                                   这个值就认证失败 —— k3s 节点上务必有 NTP。
+
+对应的客户端参数见 `xt-wasm-cli --help`（无子命令时）。"
+    );
+    std::process::exit(2)
+}
+
 /// 帮助文本里不直接写死版本号，避免与 `RealityConfig::DEFAULT_CLIENT_VERSION`
 /// 各说各话（改了一处忘了另一处，用户会照着错的填）。
 fn version_string(v: [u8; 3]) -> String {
@@ -98,12 +142,12 @@ fn version_string(v: [u8; 3]) -> String {
 }
 
 /// 读一个环境变量；空串按「未设置」处理（k8s 里没填的字段常是空串）。
-fn env_opt(key: &str) -> Option<String> {
+pub(crate) fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 /// 读一个布尔环境变量。`1`/`true`/`yes`/`on`（不分大小写）为真。
-fn env_flag(key: &str) -> bool {
+pub(crate) fn env_flag(key: &str) -> bool {
     matches!(
         std::env::var(key)
             .unwrap_or_default()
@@ -257,7 +301,7 @@ fn parse_version(s: &str) -> [u8; 3] {
 // ───────────────────────────── 解码 ─────────────────────────────
 
 /// 解 Xray `x25519` 输出的 base64url（无填充）公钥。
-fn decode_base64url_32(s: &str) -> [u8; 32] {
+pub(crate) fn decode_base64url_32(s: &str) -> [u8; 32] {
     let bytes = decode_base64url(s).unwrap_or_else(|e| {
         eprintln!("--pbk 不是合法的 base64url：{e}");
         std::process::exit(2)
@@ -269,7 +313,7 @@ fn decode_base64url_32(s: &str) -> [u8; 32] {
 }
 
 /// 解 shortId（hex）。不足 8 字节时右侧补 0，与 Xray 的语义一致。
-fn decode_hex_8(s: &str) -> [u8; 8] {
+pub(crate) fn decode_hex_8(s: &str) -> [u8; 8] {
     let mut out = [0u8; 8];
     let n = s.len() / 2;
     if n > 8 {
@@ -287,7 +331,7 @@ fn decode_hex_8(s: &str) -> [u8; 8] {
 }
 
 /// 解 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 形式的 UUID。
-fn decode_uuid(s: &str) -> [u8; 16] {
+pub(crate) fn decode_uuid(s: &str) -> [u8; 16] {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
         eprintln!(
@@ -306,7 +350,7 @@ fn decode_uuid(s: &str) -> [u8; 16] {
     out
 }
 
-fn decode_base64url(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_base64url(s: &str) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some((c - b'A') as u32),
@@ -346,6 +390,24 @@ fn main() {
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .try_init();
+    }
+
+    // 子命令分派。第一个参数是 `server` → 服务端模式；`--help` 一律给客户端帮助，
+    // `server --help` 给服务端帮助（parse_server_args 里处理）。
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("server") {
+        let args = server::parse_server_args(&argv[1..]);
+        server::run_server(args);
+    }
+    if matches!(
+        std::env::var("XT_MODE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "server"
+    ) {
+        let args = server::parse_server_args(&[]);
+        server::run_server(args);
     }
 
     let args = parse_args();

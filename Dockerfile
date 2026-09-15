@@ -56,13 +56,27 @@ COPY LICENSE LICENSE.meow-rs /app/
 
 USER 10001
 
+# 同一个镜像跑两种模式，靠子命令切换：
+#
+#   客户端（默认，无子命令）  本地 SOCKS5 → VLESS/REALITY 隧道
+#       docker run -e XT_SERVER=… -e XT_PBK=… <image>
+#
+#   服务端（`server` 子命令）  REALITY 入站 → 目标站
+#       docker run -e XT_PRIVATE_KEY=… -e XT_SHORT_IDS=… <image> server
+#
+# 注意子命令要写在**镜像名之后**：ENTRYPOINT 是 exec 形式且以 wasm 路径结尾，
+# 因此 docker/k8s 传进来的参数会直接追加到 wasm 模块的 argv 上。
+
 # 默认只监听回环 —— **这是刻意的安全默认值**。
 # 一旦绑到非回环地址而没设认证，就是一个开放代理（任何能连上的人都能白嫖你的隧道）。
 # k8s 里需要被其它 Pod 访问时，请显式设 XT_LISTEN=0.0.0.0:1080，
 # 并同时用 Secret 注入 XT_SOCKS_USER / XT_SOCKS_PASS。见 deploy/k8s/。
+#
+# 服务端模式不看这个变量，它用 XT_SERVER_LISTEN（默认 0.0.0.0:8443）——
+# 服务端**天生就要暴露**，默认绑回环没有意义。
 ENV XT_LISTEN=127.0.0.1:1080
 
-EXPOSE 1080
+EXPOSE 1080 8443
 
 # 这几个 -S flag 缺一不可，逐个说明：
 #   tcp=y                允许 wasi:sockets 建立 TCP

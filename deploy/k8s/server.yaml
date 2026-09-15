@@ -1,0 +1,127 @@
+# REALITY **入站**（服务端）的 k3s 清单：Deployment + Service。
+#
+#     kubectl apply -f deploy/k8s/server-secret.example.yaml   # 先照抄成自己的 Secret
+#     kubectl apply -f deploy/k8s/server.yaml
+#
+# 前置：先创建 Secret `xray-wasm-server`（见 server-secret.example.yaml）。
+# 公网可达性、端口选择、时钟同步等部署要点见 deploy/k8s/README.md 的「服务端」一节。
+#
+# 这个文件同时给 Deployment 和 Service，因为服务端的两半必须一起改：
+# 改了监听端口却忘了改 Service 的 targetPort，症状是外部连不上而 Pod 一切正常。
+apiVersion: v1
+kind: Service
+metadata:
+  name: xray-wasm-server
+  labels:
+    app.kubernetes.io/name: xray-wasm-server
+spec:
+  # k3s 自带 ServiceLB（Klipper）：type=LoadBalancer 会自动把端口绑到**每个节点的
+  # 节点 IP** 上，不需要 cloud provider。`kubectl get svc` 的 EXTERNAL-IP 就是节点 IP。
+  #
+  # 为什么不用 ClusterIP：客户端在集群外。为什么不用 NodePort：能用 LoadBalancer
+  # 就不要自己管端口段（k3s 上它就是 NodePort 的封装，但语义清楚得多）。
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: xray-wasm-server
+  ports:
+    - name: reality
+      port: 8443
+      targetPort: reality
+      protocol: TCP
+  # 默认 externalTrafficPolicy: Cluster 会做一次 SNAT，客户端源 IP 会丢。
+  # REALITY 不需要源 IP（认证靠密钥而非 IP 白名单），所以保持默认即可 ——
+  # 改成 Local 会引入「只有跑着 Pod 的那个节点可达」的坑，对客户端是更难查的故障。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xray-wasm-server
+  labels:
+    app.kubernetes.io/name: xray-wasm-server
+spec:
+  # 服务端是**无状态**的（REALITY 的握手密钥由每条连接现算，不落盘），
+  # 所以多副本可以直接轮询，不需要会话保持。
+  # 2 副本是为了滚动更新不断线；单条连接只落在某一个 Pod 上。
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xray-wasm-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: xray-wasm-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # 给 REALITY 的时间戳校验留足退出时间。
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: server
+          image: ghcr.io/harodggg/xray-wasm:v0.4.0
+          # 生产环境请钉具体 tag，别用 latest：跨版本升级时要能回滚到已知可用的镜像。
+          imagePullPolicy: IfNotPresent
+          # **子命令写在 args 里**（不是 command）：
+          # 镜像 ENTRYPOINT 是 `wasmtime run … /app/xt-wasm-cli.wasm`，
+          # args 会追加成 wasm 模块的 argv → 触发服务端模式。
+          # 写成 args 也让 Secret 之外的可调项集中在清单里，便于 review。
+          args: ["server"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # 服务端**天生要暴露**，所以这里默认就是 0.0.0.0（与客户端的
+            # 「默认绑回环」正好相反，那个默认值是为了防开放代理）。
+            - name: XT_SERVER_LISTEN
+              value: "0.0.0.0:8443"
+            # 时钟容差。REALITY 会把客户端时间戳和本机时间比对，超出即认证失败。
+            # 节点必须跑 NTP（k3s 节点一般都有 systemd-timesyncd / chrony）；
+            # 虚拟机从挂起恢复后时钟漂移是最常见的「昨天还好好的」故障来源。
+            - name: XT_MAX_TIME_DIFF
+              value: "60"
+          # 密钥与用户名单走 Secret，**不写进 args**：
+          # `kubectl describe pod` 会把 args 原样打印出来，等于把私钥摊在终端历史和
+          # 各种工单截图里。envFrom 让它们以环境变量形式注入（镜像里的
+          # `-S inherit-env=y` 负责把它们交给 guest）。
+          envFrom:
+            - secretRef:
+                name: xray-wasm-server
+          ports:
+            - name: reality
+              containerPort: 8443
+              protocol: TCP
+          # 探针说明：tcpSocket 探针会真的建一条 TCP 连接后立刻关闭。
+          # 服务端把「连上就关」识别为 EmptyConnection 并**刻意不记日志**，
+          # 所以探针不会刷屏（否则每 10 秒一行错误日志，真故障会被淹掉）。
+          # 它验证的是「accept 循环还活着」，这正是这个探针该管的范围。
+          startupProbe:
+            tcpSocket:
+              port: reality
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: reality
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: reality
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            # 服务端比客户端重：每条连接都要做 X25519 ECDH + AES-GCM + Ed25519 签名。
+            # 实测单核足够撑满并发上限，这里给的是保守值。
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi

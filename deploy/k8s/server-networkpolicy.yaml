@@ -1,0 +1,71 @@
+# REALITY 服务端的 NetworkPolicy。
+#
+# ⚠️ 与客户端那份（networkpolicy.yaml）取向完全不同，别照抄。
+#
+# 客户端的策略是「收紧一切」（它只需要连一个固定服务端）。
+# 服务端**做不到**这一点，原因很直白：它要代表客户端去连任意目标站点，
+# 所以 egress 在原则上必须是开放的。把 egress 收紧到几个网段会直接
+# 让代理只能访问那几个站点 —— 是个功能性错误，不是安全加固。
+#
+# 因此这里的取舍是：
+#   * ingress 收紧到「只要 TCP 8443，且必须来自集群外/世界」——
+#     这是唯一能真正收的一侧，也正好挡住「集群内其它 Pod 白嫖这个出口」；
+#   * egress 只封掉**私有网段**，防止这个 Pod 被当成打内网的跳板
+#     （这是服务端最现实的滥用方式：你的客户端被入侵后拿它扫内网）。
+#
+# 应用前务必核对 CIDR：k3s 默认 Service CIDR 10.43.0.0/16、
+# Pod CIDR 10.42.0.0/16、节点网段按你的环境填。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: xray-wasm-server
+  labels:
+    app.kubernetes.io/name: xray-wasm-server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: xray-wasm-server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # 只放行 REALITY 端口。这里刻意**不加 ipBlock.from**：
+    # 客户端的源 IP 是任意的公网地址，白名单写不出来。
+    # 「谁能用」由 REALITY 的密钥认证负责，网络层只负责「哪个端口开着」。
+    - ports:
+        - port: 8443
+          protocol: TCP
+  egress:
+    # DNS：kube-dns / CoreDNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # 出网：排除私有网段。
+    # 注意 `except` 的语义是「除这些之外都允许」，所以这里允许的是
+    # 0.0.0.0/0 减去下面几段 —— 包括所有公网地址（代理的正常目标）
+    # 以及集群外的其它内网（如果有，请补进 except）。
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # k3s 默认 Pod / Service 网段
+              - 10.42.0.0/16
+              - 10.43.0.0/16
+              # RFC1918 其余部分
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              # 回环与链路本地
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
+        # 有些站点/回落目标在 80；写上更少踩坑。
+        # 想更严格就把这行删掉（代价是 http 目标不可用）。
+        - port: 80
+          protocol: TCP

@@ -148,6 +148,7 @@ impl Metadata {
 pub mod vless;
 
 pub use vless::{
-    addr_from_metadata, decode_request, serve_inbound, Cmd, InboundConfig, InboundOutcome,
-    Request as VlessRequest, VisionConn, VlessAddr, VlessConn,
+    addr_from_metadata, decode_request, serve_inbound, serve_inbound_with_events, Cmd,
+    InboundConfig, InboundEvent, InboundOutcome, Request as VlessRequest, VisionConn, VlessAddr,
+    VlessConn,
 };

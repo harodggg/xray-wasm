@@ -327,12 +327,39 @@ fn family_of(addr: std::net::SocketAddr) -> IpAddressFamily {
     }
 }
 
-/// 建立连接。**非阻塞**：`start_connect` 立即返回，完成由 pollable 通知。
+/// 建立连接。支持 IP 字面量与域名。
+///
+/// 连接本身是**非阻塞**的：`start_connect` 立即返回，完成由 pollable 通知。
+///
+/// # DNS 是一个残留的阻塞点
+///
+/// `std::net::ToSocketAddrs` 在 wasip2 上是**同步**的（内部走
+/// `wasi:sockets/ip-name-lookup`，但 std 不暴露它的 pollable 版本），
+/// 所以域名解析会阻塞事件循环。IP 字面量不经过解析，不阻塞。
+/// 服务端连目标站时拿到的是域名，因此这一项在服务端路径上确实会命中 ——
+/// 记为已知限制，后续可换用 `ip-name-lookup` 的异步接口。
+/// 解析需要 wasmtime 打开 `-S allow-ip-name-lookup=y`。
 pub async fn connect(addr: &str) -> io::Result<NetStream> {
-    let sa: std::net::SocketAddr = addr.parse().map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("地址无法解析：{addr}"))
-    })?;
+    use std::net::ToSocketAddrs;
 
+    let resolved: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+    let mut last_err = None;
+    for sa in resolved {
+        match connect_addr(sa).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("无法解析出任何地址：{addr}"),
+        )
+    }))
+}
+
+/// 连到一个已解析的地址。
+async fn connect_addr(sa: std::net::SocketAddr) -> io::Result<NetStream> {
     let socket =
         wasip2::sockets::tcp_create_socket::create_tcp_socket(family_of(sa)).map_err(wasi_err)?;
     let network = wasip2::sockets::instance_network::instance_network();

@@ -9,8 +9,10 @@
 
 pub mod conn;
 pub mod header;
+pub mod server;
 pub mod vision;
 
 pub use conn::VlessConn;
 pub use header::{addr_from_metadata, Cmd, VlessAddr};
+pub use server::{decode_request, serve_inbound, InboundConfig, InboundOutcome, Request};
 pub use vision::VisionConn;

@@ -16,8 +16,8 @@
 
 use std::io;
 
+use crate::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use xt_wasm_runtime::Stream;
 
 /// 在两个流之间双向搬运，直到**两个方向都结束**。
 ///
@@ -70,7 +70,7 @@ mod tests {
         let (client, relay_a) = pipe();
         let (relay_b, server) = pipe();
 
-        let out = xt_wasm_runtime::block_on(async move {
+        let out = crate::block_on(async move {
             futures::join!(
                 // 中继
                 async move { relay_bidirectional(Box::new(relay_a), Box::new(relay_b)).await },
@@ -112,7 +112,7 @@ mod tests {
         let (client, relay_a) = pipe();
         let (relay_b, server) = pipe();
 
-        let out = xt_wasm_runtime::block_on(async move {
+        let out = crate::block_on(async move {
             futures::join!(
                 async move { relay_bidirectional(Box::new(relay_a), Box::new(relay_b)).await },
                 async move {

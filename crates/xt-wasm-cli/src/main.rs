@@ -26,7 +26,6 @@
 //! 顺序与 port-map §4.3 一致。VLESS 请求头用 `new_deferred`（不在此刻等服务端应答），
 //! 应答在首次读时顺带处理。
 
-mod relay;
 mod socks5;
 
 use std::cell::Cell;
@@ -34,7 +33,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use xt_wasm_runtime::{block_on, sleep, spawn_task, timeout, NetStream, Stream};
+use xt_wasm_runtime::{
+    block_on, relay_bidirectional, sleep, spawn_task, timeout, NetStream, Stream,
+};
 use xt_wasm_tls::{RealityConfig, RealityTlsLayer, TlsConfig, Transport};
 use xt_wasm_vless::{Cmd, VisionConn, VlessAddr, VlessConn};
 
@@ -561,7 +562,7 @@ async fn serve_inner(mut stream: NetStream, shared: &Shared) -> Result<(String, 
         .await
         .map_err(|e| format!("回 SOCKS5 应答失败：{e}"))?;
 
-    relay::relay_bidirectional(Box::new(stream), Box::new(tunnel))
+    relay_bidirectional(Box::new(stream), Box::new(tunnel))
         .await
         .map_err(|e| format!("转发失败：{e}"))?;
 

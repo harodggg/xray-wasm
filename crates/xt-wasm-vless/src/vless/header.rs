@@ -45,7 +45,7 @@ use crate::Metadata;
 // ─── Address type ─────────────────────────────────────────────────────────────
 
 /// Destination address for a VLESS connection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VlessAddr {
     Ipv4([u8; 4]),
     Ipv6([u8; 16]),

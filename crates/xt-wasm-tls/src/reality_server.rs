@@ -434,9 +434,12 @@ pub enum HandshakeOutcome {
         stream: RealityTlsStream,
         auth: Authenticated,
     },
-    /// 未通过认证。调用方应当把 `buffered` 以及之后读到的所有字节
-    /// **原样转发**给 `dest`，让主动探测者看到真实网站。
+    /// 未通过认证。调用方应当把 `buffered` 补发给 `dest`，
+    /// 然后用 `stream` 继续双向转发，让主动探测者看到真实网站。
     Fallback {
+        /// 连接本身。**必须一起带出来** —— 只给 `buffered` 的话，
+        /// 后续字节就接不上了，回退也就无从谈起。
+        stream: Box<dyn Stream>,
         /// 已经从客户端读走、必须补发给 `dest` 的原始字节（含 TLS record 头）。
         buffered: Vec<u8>,
         server_name: Option<String>,
@@ -459,6 +462,7 @@ pub async fn reality_server_handshake(
 
     if record.typ != TLS_RECORD_HANDSHAKE {
         return Ok(HandshakeOutcome::Fallback {
+            stream: inner,
             buffered,
             server_name: None,
         });
@@ -469,6 +473,7 @@ pub async fn reality_server_handshake(
         Ok(ch) => ch,
         Err(_) => {
             return Ok(HandshakeOutcome::Fallback {
+                stream: inner,
                 buffered,
                 server_name: None,
             })
@@ -484,6 +489,7 @@ pub async fn reality_server_handshake(
         Ok(a) => a,
         Err(_) => {
             return Ok(HandshakeOutcome::Fallback {
+                stream: inner,
                 buffered,
                 server_name: ch.server_name.clone(),
             })
@@ -1105,8 +1111,16 @@ mod tests {
             futures::join!(
                 reality_server_handshake(Box::new(server_io), &server_cfg),
                 async {
-                    // 客户端握手会失败（服务端不回 ServerHello），忽略结果
-                    let _ = reality_handshake(Box::new(client_io), SNI, &[], &client_cfg).await;
+                    // 客户端握手必然失败：回退路径下服务端**什么都不会回**。
+                    //
+                    // **必须加超时**：Fallback 现在会把服务端那半连接一并返回
+                    // （回退要接着转发，不能丢），所以它不再被 drop，
+                    // 客户端也就看不到 EOF —— 不加超时这里会永远等下去。
+                    let _ = xt_wasm_runtime::timeout(
+                        std::time::Duration::from_millis(300),
+                        reality_handshake(Box::new(client_io), SNI, &[], &client_cfg),
+                    )
+                    .await;
                 }
             )
         });

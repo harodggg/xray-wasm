@@ -113,6 +113,10 @@ pub use platform::{
     NetStream,
 };
 
+mod relay;
+
+pub use relay::relay_bidirectional;
+
 #[cfg(test)]
 mod tests {
     use super::*;

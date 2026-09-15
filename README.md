@@ -244,8 +244,8 @@ REALITY 有两个方向，本工程只实现了其中**一个**：
 | 2 | **每连接伪造临时 ed25519 证书** —— 客户端校验的是 `HMAC-SHA512(authKey, 证书公钥) == 证书签名域`，所以服务端要**用 HMAC 冒充签名字段** | ✅ **已完成** |
 | 3 | **X.509 DER 编码** —— 手工拼 TBSCertificate + 伪造的 signatureValue | ✅ **已完成** |
 | 1 | **完整的 TLS 1.3 服务端握手** —— ServerHello / EncryptedExtensions / Certificate / CertificateVerify / Finished 的服务端构造与服务端密钥调度 | ✅ **已完成** |
-| 5 | **VLESS 服务端解码 + Vision 服务端流控** —— 现有的是编码方向（客户端），解码方向在移植时被排除了 | ⬜ 未开始 |
-| 6 | **`dest` 回退** —— 认证失败的连接必须**原样转发**到真实站点，让主动探测者看到真实网站 | ⬜ 未开始 |
+| 5 | **VLESS 服务端解码 + Vision 服务端流控** —— 解码方向已实现；**Vision 服务端侧尚未实现**（客户端请求时明确报错，不会默默做错） | 🟡 解码 ✅ / Vision ⬜ |
+| 6 | **`dest` 回退** —— 认证失败的连接**原样转发**到真实站点，让主动探测者看到真实网站 | ✅ **已完成** |
 
 已完成阶段的代码在 `crates/xt-wasm-tls/src/reality_server.rs`，
 验证过程见 [`docs/verification-log.md`](docs/verification-log.md) 的 **V18 / V19**。

@@ -72,3 +72,24 @@ pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
     }
     false
 }
+
+/// 跨 crate 测试用的夹具工具。
+///
+/// 只为测试存在：让别的 crate 的集成测试能造出一对匹配的
+/// REALITY 服务端 / 客户端密钥，而不必各自重写一遍 X25519 调用。
+#[doc(hidden)]
+pub mod test_support {
+    use crate::reality::{clamp_x25519_private, x25519_public_from_private};
+
+    /// 固定的测试私钥（`[0x42; 32]` 做 X25519 clamp）—— 它不保护任何东西。
+    pub fn fixture_private_key() -> [u8; 32] {
+        let mut k = [0x42u8; 32];
+        clamp_x25519_private(&mut k);
+        k
+    }
+
+    /// 由私钥推出公钥。
+    pub fn public_from_private(private: &[u8; 32]) -> [u8; 32] {
+        x25519_public_from_private(private)
+    }
+}

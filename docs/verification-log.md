@@ -707,3 +707,80 @@ cargo run -p xt-wasm-tls --release --example reality_server_probe -- \
 | 1. TLS 1.3 服务端握手 | ✅ **完成**（本阶段，官方客户端互通通过） |
 | 5. VLESS 服务端解码 + Vision | ⬜ 未开始 |
 | 6. `dest` 回退 | ⬜ 未开始（回退**判定**已就位，转发未实现） |
+
+---
+
+## V20 · REALITY 服务端 · 阶段 5/6：VLESS 解码 + 转发 + dest 回退 —— **全链路打通**
+
+### 做了什么
+
+* **阶段 5（VLESS 服务端解码）**：`xt-wasm-vless/src/vless/server.rs`。
+  与客户端的 `encode_request` 严格对称。
+* **阶段 6（转发 + 回退）**：新增 `serve_inbound`，把两条路径都串起来：
+
+```text
+授权客户端：REALITY 握手 → 解 VLESS 头 → 校验 UUID → 连目标 → 双向转发
+其他人    ：REALITY 握手失败 → 把已读字节补发给 dest → 双向转发
+```
+
+`relay_bidirectional` 从 `xt-wasm-cli` 上移到 `xt-wasm-runtime`（服务端也要用，
+不该让协议层依赖 CLI）。
+
+### 官方客户端 → 我们的服务端 → 真实网站（端到端）
+
+```
+官方客户端经我们的服务端访问真实网站：
+  example.com  -> HTTP 200
+  出口 IP: 45.207.197.185
+
+我们服务端日志：
+  OK Forwarded { target: "example.com:443" }
+```
+
+即：**官方 Xray 客户端经纯 Rust 实现的 REALITY 服务端成功代理到真实网站**。
+复现见 `crates/xt-wasm-vless/examples/reality_server_full.rs`。
+
+### 抗主动探测（REALITY 的根本）
+
+用 `openssl s_client` 模拟一个**不带任何 REALITY 认证**的探测者，
+直接对我们的服务端发起 TLS：
+
+```
+subject=CN=www.cloudflare.com
+issuer=C=US, O=Let's Encrypt, CN=YE2
+```
+
+探测者拿到的是 **Cloudflare 的真证书** —— 它无法区分我们的服务器和真实的
+Cloudflare 站点。这是 REALITY 区别于普通 TLS 代理的关键，也是「回退」这条路径
+存在的全部意义。
+
+### 集成测试抓出的三个问题（都值得记）
+
+1. **服务端漏发 VLESS 响应头**。客户端建连后会先读 `[version][addon_len]` 两个字节，
+   服务端不回的话它会把负载首字节当版本号 —— 症状是
+   `version mismatch: expected 0x00, got 0x68`（`0x68` 正是负载首字符 `h`）。
+2. **`new_deferred` 是延迟写头的**（设计如此：让请求搭上首个 Vision 帧），
+   所以两条负面用例里客户端根本没把请求头发出去，服务端只看到 EOF。
+3. **回退测试一度挂死**：回退路径下服务端什么都不回，客户端会永远等 ServerHello，
+   握着连接不放，中继两端都不结束。加超时解决 —— 同一个教训在
+   `xt-wasm-tls` 里也复现了一次（`Fallback` 开始把连接一并返回之后，
+   原来靠 drop 触发 EOF 的用例就不再成立了）。
+
+### 一个被明确拒绝而非默默做错的点
+
+客户端请求 **Vision 流控**时，服务端会**明确报错**而不是继续。
+Vision 会把负载包进填充帧，服务端不拆帧就会把这些字节当原始数据发给目标站 ——
+输出是错的却不报错，属于最难排查的那类故障。
+**Vision 服务端侧是目前唯一还没实现的协议部分**，见 README。
+
+### 阶段状态
+
+| 阶段 | 状态 |
+|---|---|
+| 4. 服务端侧 REALITY 认证解密 | ✅ 完成 |
+| 2. 每连接伪造临时 ed25519 证书 | ✅ 完成 |
+| 3. X.509 DER 编码 | ✅ 完成 |
+| 1. TLS 1.3 服务端握手 | ✅ 完成 |
+| 5. VLESS 服务端解码 | ✅ 完成 |
+| 6. `dest` 回退 | ✅ 完成 |
+| （额外）Vision 服务端流控 | ⬜ **未实现**（客户端请求时明确报错） |

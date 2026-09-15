@@ -28,9 +28,14 @@ pub use xt_wasm_runtime::{Result, Stream, Transport, TransportError};
 
 mod config;
 mod reality;
+mod reality_server;
 
 pub use config::{ClientCert, EchOpts, RealityConfig, TlsConfig};
 pub use reality::{reality_handshake, RealityTlsLayer, RealityTlsStream};
+pub use reality_server::{
+    authenticate, forge_certificate, parse_client_hello, Authenticated, ClientHello,
+    RealityServerConfig,
+};
 
 /// Enable raw (unframed) passthrough in **both** directions if `stream` is a
 /// [`RealityTlsStream`].  Returns `true` when the stream was recognised.

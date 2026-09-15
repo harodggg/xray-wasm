@@ -39,7 +39,7 @@ use crate::{
 };
 
 type HmacSha256 = Hmac<Sha256>;
-type HmacSha512 = Hmac<Sha512>;
+pub(crate) type HmacSha512 = Hmac<Sha512>;
 
 const TLS_RECORD_HANDSHAKE: u8 = 22;
 const TLS_RECORD_APPLICATION_DATA: u8 = 23;
@@ -54,9 +54,9 @@ const HS_CERTIFICATE: u8 = 11;
 const HS_CERTIFICATE_VERIFY: u8 = 15;
 const HS_FINISHED: u8 = 20;
 
-const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+pub(crate) const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 
-const GROUP_X25519: u16 = 0x001d;
+pub(crate) const GROUP_X25519: u16 = 0x001d;
 
 // ─── Pre-authentication server-flight bounds (issue #430) ─────────────────
 //
@@ -641,7 +641,7 @@ fn transport_io_error(e: TransportError) -> io::Error {
     io::Error::other(e)
 }
 
-fn build_reality_client_hello(
+pub(crate) fn build_reality_client_hello(
     server_name: &str,
     alpn: &[String],
     random: &[u8; 32],
@@ -792,7 +792,7 @@ fn push_ext(out: &mut Vec<u8>, typ: u16, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > u16::MAX as usize {
         return Err(TransportError::Tls("TLS record payload too large".into()));
     }
@@ -870,13 +870,13 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
     }
 }
 
-struct TlsRecord {
+pub(crate) struct TlsRecord {
     header: [u8; 5],
     typ: u8,
     payload: Vec<u8>,
 }
 
-async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
+pub(crate) async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
     let mut header = [0u8; 5];
     match r.read_exact(&mut header).await {
         Ok(_) => {}
@@ -1089,7 +1089,7 @@ fn parse_leaf_certificate(body: &[u8]) -> Result<Vec<u8>> {
     Ok(cert)
 }
 
-fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<()> {
+pub(crate) fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<()> {
     let Some((ed25519_pubkey, cert_signature)) = extract_ed25519_cert_parts(cert_der) else {
         return Err(TransportError::Tls(
             "Reality authentication failed: leaf certificate is not Ed25519".into(),
@@ -1189,7 +1189,7 @@ fn der_read<'a>(input: &'a [u8], pos: &mut usize) -> Option<DerNode<'a>> {
 }
 
 #[derive(Clone, Copy)]
-enum CipherSuite {
+pub(crate) enum CipherSuite {
     Aes128GcmSha256,
 }
 
@@ -1210,7 +1210,7 @@ impl CipherSuite {
     }
 }
 
-struct HandshakeKeys {
+pub(crate) struct HandshakeKeys {
     client: RecordKey,
     server: RecordKey,
     client_secret: [u8; 32],
@@ -1240,7 +1240,7 @@ impl HandshakeKeys {
     }
 }
 
-struct ApplicationKeys {
+pub(crate) struct ApplicationKeys {
     client: RecordKey,
     server: RecordKey,
 }
@@ -1261,7 +1261,7 @@ enum AeadCipher {
     Aes128(Box<Aes128Gcm>),
 }
 
-struct RecordKey {
+pub(crate) struct RecordKey {
     cipher: AeadCipher,
     iv: [u8; 12],
     seq: u64,
@@ -1387,7 +1387,12 @@ fn derive_secret(secret: &[u8; 32], label: &[u8], transcript_hash: &[u8]) -> [u8
     out
 }
 
-fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
+pub(crate) fn hkdf_expand_label(
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    len: usize,
+) -> Vec<u8> {
     let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
     put_u16(len as u16, &mut info);
     info.push((6 + label.len()) as u8);
@@ -1398,7 +1403,7 @@ fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) ->
     hkdf_expand(secret, &info, len)
 }
 
-fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+pub(crate) fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     let prk = hkdf_extract(salt, secret);
     hkdf_expand(&prk, info, len)
 }
@@ -1428,17 +1433,17 @@ fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     okm
 }
 
-fn clamp_x25519_private(private: &mut [u8; 32]) {
+pub(crate) fn clamp_x25519_private(private: &mut [u8; 32]) {
     private[0] &= 248;
     private[31] &= 127;
     private[31] |= 64;
 }
 
-fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::x25519(*private, x25519_dalek::X25519_BASEPOINT_BYTES)
 }
 
-fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
+pub(crate) fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
     let out = x25519_dalek::x25519(*private, *peer_public);
     // An all-zero shared secret means the peer sent a low-order point; BoringSSL's
     // `X25519` reports that as a failure and RFC 7748 §6.1 requires rejecting it.
@@ -1477,11 +1482,11 @@ fn read_u24(b: &[u8]) -> usize {
     ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize
 }
 
-fn put_u16(value: u16, out: &mut Vec<u8>) {
+pub(crate) fn put_u16(value: u16, out: &mut Vec<u8>) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_u24(value: usize, out: &mut Vec<u8>) {
+pub(crate) fn put_u24(value: usize, out: &mut Vec<u8>) {
     out.push(((value >> 16) & 0xff) as u8);
     out.push(((value >> 8) & 0xff) as u8);
     out.push((value & 0xff) as u8);

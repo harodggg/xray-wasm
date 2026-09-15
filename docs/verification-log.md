@@ -522,3 +522,84 @@ V16 把并发做出来了，但底层仍有两个硬伤，**根因是同一个**
 | `cargo test --workspace` | **69 passed / 0 failed** |
 | `./scripts/e2e-test.sh` | **8/8 通过**（含并发、半开连接、两个认证负向用例） |
 | 协议层代码改动 | **0 行**（`xt-wasm-tls` / `xt-wasm-vless` 未动） |
+
+---
+
+## V18 · REALITY 服务端（入站）· 阶段 1：认证解密 + 证书伪造
+
+### 背景
+
+本工程此前只做客户端（socket → REALITY）。现在开始做反方向（REALITY → socket）。
+按 README 里列的六项拆成阶段，**本阶段完成第 4 项（服务端侧认证）与证书伪造**，
+这是 REALITY 特有、也最容易做错的部分；TLS 1.3 服务端握手与 VLESS 解码在后续阶段。
+
+### 认证与客户端严格对称
+
+```text
+AuthKey = ECDH(server_privkey, 客户端 ClientHello 的 X25519 key_share)
+AuthKey = HKDF-SHA256(ikm=AuthKey, salt=ClientHello.random[:20], info="REALITY")
+明文    = AES-256-GCM.Open(
+              nonce = ClientHello.random[20:32],
+              ct    = ClientHello.session_id,
+              aad   = **session_id 字段置零**的完整握手消息)
+明文    = [版本(3)] [0] [unix 时间戳(4)] [shortId(8)]
+```
+
+**AAD 是最容易踩的坑**：两侧都必须用「session_id 被置零」的那份，而不是收到的原始字节。
+客户端封的时候字段还是全零，服务端要是拿原始字节去开就必然失败。
+
+### 跨实现验证（本阶段最有价值的证据）
+
+只用自己的客户端测自己的服务端，只能证明「自洽」。所以额外抓了一份
+**官方 Xray 客户端真实发出的 ClientHello** 作为夹具：
+
+| 项 | 值 |
+|---|---|
+| 抓取方式 | 起裸 TCP 监听，让官方客户端连过来，抓第一条记录，去掉 5 字节 record 头 |
+| 客户端配置 | `fingerprint: chrome`，`flow: xtls-rprx-vision` |
+| 大小 | record 1792 字节 / 握手消息 **1787 字节** |
+| 特征 | 带 GREASE；`key_share` 有**三份**：GREASE、X25519MLKEM768(1216B)、纯 X25519(32B) |
+| 夹具私钥 | `[0x42;32]` 做 X25519 clamp（刻意构造的测试值，不保护任何东西） |
+| 夹具文件 | `crates/xt-wasm-tls/src/testdata/xray-clienthello.hex` |
+
+由此得到三条跨实现结论（都是自动化测试）：
+
+1. `parses_official_xray_client_hello` —— 解析器吃得下 1787 字节的真实包；
+   能从三份 key_share 里**挑出纯 X25519 那份**（MLKEM768 那份 1216 字节要跳过）。
+2. `authenticates_official_xray_client_hello` —— **认证通过**，
+   还原出 `shortId = deadbeef00112233`、`client_version = [26, 3, 27]`。
+3. `forged_cert_for_official_client_hello_verifies` —— 基于官方客户端的
+   AuthKey 伪造出的证书，能过我们自己客户端的校验逻辑。
+
+> 附带确认了一个此前不确定的点：官方 chrome 指纹**同时**发纯 X25519 key_share，
+> 所以服务端不需要实现 ML-KEM 也能取到共享密钥（MLKEM768 那份可以直接跳过）。
+
+### 回环验证
+
+`forged_certificate_passes_our_own_client_verifier` —— 服务端伪造的证书
+（HMAC 冒充签名字段）被**本工程客户端的校验逻辑**接受；
+换成别的 authKey 则必然失败（防中间人属性）。
+
+### 负面用例
+
+`rejects_wrong_server_key`（私钥不对 → session_id 解不开）、
+`rejects_unknown_short_id`、`rejects_clock_skew_outside_window`、
+`rejects_disallowed_sni`，以及 6 组畸形输入（解析器全程不 panic）。
+另有一条专测 AAD 语义：断言 AAD 里 `[39..71]` 全零、其余字节与原始一致。
+
+### 一个值得记下的测试自身缺陷
+
+第一版用例给 `authenticate` 传了写死的 `now = 1_700_000_000`，
+而 `build_reality_client_hello` 内部取的是 `SystemTime::now()` —— 相差 8900 万秒，
+4 个用例全红。**这其实说明时钟窗口校验是对的**（它正确地拒绝了），
+但用例本身失效了。改成取真实当前时间 + 容许跨秒边界。
+
+### 当前状态
+
+| 阶段 | 状态 |
+|---|---|
+| 4. 服务端侧 REALITY 认证解密 | ✅ **完成**（本阶段） |
+| 证书伪造（含 X.509 DER） | ✅ **完成**（本阶段） |
+| 1. TLS 1.3 服务端握手 | ⬜ 未开始 |
+| 5. VLESS 服务端解码 + Vision | ⬜ 未开始 |
+| 6. `dest` 回退 | ⬜ 未开始 |

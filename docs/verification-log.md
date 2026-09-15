@@ -1915,3 +1915,54 @@ let (input, output) = socket.finish_connect()?;
 （`check_write` 那次的教训：**不要相信 wasmtime 的就绪判定**）。
 
 至此**仍未完全修复**，但进度是实打实的：一个已验证的修复 + 三条路径已澄清。
+
+### V24 十八续：第二个源的假设，以及**为什么到这里停手**
+
+#### 假设（未验证，勿当成结论）
+
+按 `check_write` 那次的教训（**wasmtime 的就绪判定会误报**），第二个源**最可能**在
+`connect_addr` 或包着它的 `timeout` 上：
+
+```rust
+// wasi.rs :: connect_addr
+socket.start_connect(&network, to_wasi_addr(sa))?;
+AsyncPollable::new(socket.subscribe()).wait_for().await;   // ← 裸等待，不校验
+let (input, output) = socket.finish_connect()?;
+```
+
+以及 `connect()` 里的：
+
+```rust
+match timeout(budget, connect_addr(sa)).await { ... }      // ← 超时会 drop 掉 connect future
+```
+
+两个可疑点：
+
+1. **`wait_for()` 相信了一次就绪信号**。若它是误报，`finish_connect()` 会失败，
+   而且**注册在 reactor 里的 waker 可能留在那儿**。
+2. **`timeout` 会 drop 掉尚未完成的 `connect_addr` future**，而那个 future 手里
+   握着已注册的 waker / 未关闭的 socket。**drop 一个已注册 waker 的 future
+   正是"留下失效注册"的典型形状** —— 而它只在「连接挂住、超时触发」时发生，
+   与「只有悬停连接才发作」完全吻合。
+
+#### 为什么在这里停手
+
+我已经没有余量做「先测机制、再改代码」的完整循环，而**基于推测提交改动**在这个
+bug 上已经失败 6 次，其中还两次把结论下反写进仓库。**未验证的改动不留** —— 这是
+V24 里唯一被证明有效的纪律。所以我停在一个**已验证的部分修复**上，而不是再赌一次。
+
+已交付的确定成果：
+
+* ✅ **写路径误报**已修复并验证（两个探针 501 → 0，109 单测通过）；
+* ✅ `read` / `write` / `read+write` 三条路径已澄清；
+* ✅ 第二个源已收敛到 `connect_addr` / `timeout` 两处，且上面两个假设都有具体形状；
+* ✅ 三个 socket 层探针 + 一个端到端回归测试，可在几十秒内验证任何新改动；
+* ✅ 线上靠 `livenessProbe` 兜底（卡死约 60 秒自动重启）。
+
+#### 下一个人该做的第一步（唯一）
+
+**先测，不要先改。** 在 socket 层探针上加一步 `connect("10.255.255.1:5226")`：
+
+* **~500 ticks** ⇒ 就是它。然后按顺序试：(a) 去掉 `timeout` 包装（看是不是 drop
+  造成的失效注册）；(b) `connect_addr` 里对 `finish_connect()` 的错误做有界重试。
+* **0 ticks** ⇒ 不是它，第二个源在协议层握手与 connect 的交互上，回到二分。

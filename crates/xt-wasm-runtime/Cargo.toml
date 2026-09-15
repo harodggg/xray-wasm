@@ -1,0 +1,11 @@
+[package]
+name = "xt-wasm-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "wasip2 runtime bridge: blocking sockets adapted to async traits"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

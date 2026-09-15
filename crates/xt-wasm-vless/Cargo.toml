@@ -1,0 +1,25 @@
+# xt-wasm-vless — VLESS request header + XTLS-Vision flow.
+# Ported from meow-rs <https://github.com/meow-rs/meow-rs> @ a2be4de1c315daa22e53ad1118538936241d592f
+# (crates/meow-proxy/src/vless/*, crates/meow-common/src/*).
+# MIT licensed, Copyright (c) 2026 Max Lv. See LICENSE.meow-rs.
+# Modified for the wasm32-wasip2 port.
+
+[package]
+name = "xt-wasm-vless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VLESS request header + XTLS-Vision flow (ported, wasm-friendly)"
+
+[dependencies]
+bytes = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+xt-wasm-runtime = { workspace = true }
+xt-wasm-tls = { workspace = true }
+
+[dev-dependencies]
+# Tests replace upstream `tokio::spawn` with `futures::join!` (no runtime).
+futures = { workspace = true }

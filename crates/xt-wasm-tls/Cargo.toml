@@ -1,0 +1,28 @@
+[package]
+name = "xt-wasm-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hand-rolled TLS 1.3 + REALITY client (ported, wasm-friendly)"
+
+[dependencies]
+# 共享 shim 类型（TransportError/Result/Stream/Transport）+ block_on executor。
+xt-wasm-runtime = { workspace = true }
+
+# 协议核心：全部纯 Rust，wasip2 可用（见 docs/port-map.md §2.11）。
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+
+# 只取 tokio 的 io trait / 工具，不引入任何 runtime。
+tokio = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# 仅测试用：把上游的 tokio::spawn 换成 futures::join!。
+futures = { workspace = true }

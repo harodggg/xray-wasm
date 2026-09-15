@@ -1,0 +1,16 @@
+# Rust 构建产物。
+# 本工程的 CARGO_TARGET_DIR 被 scripts/env.sh 指到工作区外，所以这里通常不会有
+# target/；保留这条是为了让「不 source env.sh 就直接 cargo build」也不会误提交。
+/target/
+
+# wasmtime 的 JIT 缓存。
+# scripts/env.sh 把它指到这里，是为了不写 ~/Library/Caches（受限环境下不可写）。
+/.wasmtime-cache/
+
+# 端到端测试运行时产生的日志（scripts/e2e-test.sh）
+/.e2e-server.log
+/.e2e-client.log
+
+# 编辑器与系统
+.DS_Store
+*.swp

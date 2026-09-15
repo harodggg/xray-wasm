@@ -1,0 +1,19 @@
+[package]
+name = "xt-wasm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "wasip2 代理 CLI：本地 SOCKS5 → VLESS + XTLS-Vision + REALITY 隧道"
+
+[dependencies]
+xt-wasm-runtime = { workspace = true }
+xt-wasm-tls = { workspace = true }
+xt-wasm-vless = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# 仅宿主构建可用的调试输出。移植进来的代码用 `tracing::debug!` 打了握手各阶段，
+# 但没有 subscriber 就什么都看不到；wasm 侧不需要（也不该）装它。
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

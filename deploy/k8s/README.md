@@ -143,10 +143,15 @@ k3s 自带 **ServiceLB（Klipper）**：`type: LoadBalancer` 不需要任何 clo
 
 ```sh
 # a) 抗主动探测：外部看不到任何伪造证书
-echo | openssl s_client -connect <节点IP>:8443 -servername www.example.com 2>&1 \
-  | grep -E 'subject=|a:PKEY:'
-#   期望：CN=www.example.com 且 a:PKEY: EC (prime256v1)  ← dest 的真实证书
-#   若看到 a:PKEY: ED25519，说明回退没生效，服务端正在对探测者暴露自己
+#    不要 grep openssl 的人类可读输出：macOS(LibreSSL) 与 Ubuntu(OpenSSL 3)
+#    的排版不同（`CN=` vs `CN = `、`a:PKEY: EC` vs `id-ecPublicKey`），
+#    会出现在一边通过、在另一边红。用结构化判定：
+echo | openssl s_client -connect <节点IP>:8443 -servername www.example.com 2>/dev/null \
+  | openssl x509 -noout -subject -nameopt RFC2253        # 期望 subject=CN=www.example.com
+echo | openssl s_client -connect <节点IP>:8443 -servername www.example.com 2>/dev/null \
+  | openssl x509 -noout -pubkey | openssl pkey -pubin -text -noout
+#   期望 prime256v1（dest 的真实 EC 公钥）
+#   若出现 ED25519，说明回退没生效，服务端正在对探测者暴露自己
 
 # b) 端到端：真实客户端能出去（HTTP 200）
 #    官方客户端 + 上面的片段，然后：

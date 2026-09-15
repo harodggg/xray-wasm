@@ -180,18 +180,34 @@ pass "服务端日志：认证通过 user=$UUID -> $TARGET:443"
 echo "==> 4/5 抗探测：未认证的 TLS 探测者必须看到 dest 的真实证书"
 # 判别依据：真证书是 EC (prime256v1)，我们伪造的证书是 Ed25519。
 # 只看 subject 是不够的 —— 伪造证书的 CN 也等于 serverName，那正是它该有的样子。
-PROBE=$(echo | openssl s_client -connect "127.0.0.1:$LPORT" -servername "$DEST_HOST" 2>&1 || true)
-printf '%s\n' "$PROBE" | grep -q "CN=$DEST_HOST" || {
-    printf '%s\n' "$PROBE" | head -20 >&2
+#
+# 这里**不解析 openssl 的人类可读输出**。第一版图省事去 grep `a:PKEY: EC`，
+# 本地（LibreSSL/macOS）通过、CI（OpenSSL 3/Ubuntu）直接红 —— 两边的格式不同：
+#     macOS：  s:CN=www.cloudflare.com        a:PKEY: EC, (prime256v1)
+#     Ubuntu： s:CN = www.cloudflare.com      a:PKEY: id-ecPublicKey, 256 (bit)
+# 改成把证书取出来交给 `openssl x509` / `openssl pkey` 做**结构化**判定，
+# 这两个子命令的输出格式跨平台稳定得多。
+PROBE_CERT=$(echo | openssl s_client -connect "127.0.0.1:$LPORT" -servername "$DEST_HOST" 2>/dev/null \
+    | openssl x509 2>/dev/null || true)
+[ -n "$PROBE_CERT" ] || fail "探测者连证书都没拿到（回退路径没生效？）"
+
+# -nameopt RFC2253 让 subject 输出成无空格的 `CN=www.example.com`，两端一致。
+SUBJECT=$(printf '%s\n' "$PROBE_CERT" | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null || true)
+printf '%s\n' "$SUBJECT" | grep -q "CN=$DEST_HOST" || {
+    printf '  实际 subject：%s\n' "$SUBJECT" >&2
     fail "探测者没拿到 CN=$DEST_HOST 的证书"
 }
-printf '%s\n' "$PROBE" | grep -qi "PKEY: ED25519" && {
-    printf '%s\n' "$PROBE" | head -20 >&2
+
+# 公钥算法交给 openssl 判定，不看文本排版。
+KEYINFO=$(printf '%s\n' "$PROBE_CERT" | openssl x509 -noout -pubkey 2>/dev/null \
+    | openssl pkey -pubin -text -noout 2>/dev/null || true)
+printf '%s\n' "$KEYINFO" | grep -qi "ED25519" && {
+    printf '%s\n' "$KEYINFO" >&2
     fail "探测者拿到了我们伪造的 Ed25519 证书 —— 这就是可被主动探测的特征！"
 }
-printf '%s\n' "$PROBE" | grep -q "a:PKEY: EC" || {
-    printf '%s\n' "$PROBE" | head -20 >&2
-    fail "探测者拿到的证书不是 dest 的真实 EC 证书"
+printf '%s\n' "$KEYINFO" | grep -qi "prime256v1" || {
+    printf '%s\n' "$KEYINFO" >&2
+    fail "探测者拿到的证书不是 dest 的真实 EC (prime256v1) 证书"
 }
 # 服务端也必须把这条连接记成回退（而不是当成错误吞掉）——
 # 探测流量在日志里看不见的话，运维根本无法判断自己有没有被扫。

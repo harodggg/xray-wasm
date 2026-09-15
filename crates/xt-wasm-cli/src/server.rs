@@ -34,7 +34,7 @@ use xt_wasm_runtime::{block_on, sleep, spawn_task};
 use xt_wasm_tls::RealityServerConfig;
 use xt_wasm_vless::{serve_inbound_with_events, InboundConfig, InboundEvent, InboundOutcome};
 
-use crate::{decode_base64url, decode_hex_8, decode_uuid, env_flag, env_opt, usage_server};
+use crate::{decode_base64url, decode_hex_8, decode_uuid, env_opt, usage_server};
 
 /// 并发上限。与客户端同量级：内存与 fd 有限，没有背压会被慢连接拖垮。
 const MAX_CONCURRENT_CONNS: usize = 256;
@@ -89,7 +89,6 @@ pub fn parse_server_args(argv: &[String]) -> ServerArgs {
     let mut dest = env_opt("XT_DEST");
     let mut users = env_opt("XT_USERS");
     let mut max_time_diff = env_opt("XT_MAX_TIME_DIFF");
-    let _ = env_flag("XT_SELF_TEST"); // 服务端模式没有这个开关，读一下保持行为一致
 
     let mut i = 0;
     while i < argv.len() {
@@ -131,7 +130,10 @@ pub fn parse_server_args(argv: &[String]) -> ServerArgs {
     if short_ids_raw.is_empty() {
         die("缺少 --short-ids（或 XT_SHORT_IDS）。至少要有一个，否则没有客户端能通过认证");
     }
-    let short_ids: Vec<[u8; 8]> = short_ids_raw.iter().map(|s| decode_hex_8(s)).collect();
+    let short_ids: Vec<[u8; 8]> = short_ids_raw
+        .iter()
+        .map(|s| decode_hex_8("--short-ids", s))
+        .collect();
 
     let server_names = split_list(&server_names.unwrap_or_default());
     if server_names.is_empty() {
@@ -146,7 +148,10 @@ pub fn parse_server_args(argv: &[String]) -> ServerArgs {
     if users_raw.is_empty() {
         die("缺少 --users（或 XT_USERS）。空列表意味着谁也连不上");
     }
-    let users: Vec<[u8; 16]> = users_raw.iter().map(|s| decode_uuid(s)).collect();
+    let users: Vec<[u8; 16]> = users_raw
+        .iter()
+        .map(|s| decode_uuid("--users", s))
+        .collect();
 
     let max_time_diff_secs = max_time_diff
         .map(|s| {

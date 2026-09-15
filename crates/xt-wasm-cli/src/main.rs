@@ -221,10 +221,13 @@ fn parse_args() -> Args {
         eprintln!("缺少 --pbk");
         usage()
     }));
-    let short_id = decode_hex_8(&sid.unwrap_or_else(|| {
-        eprintln!("缺少 --sid");
-        usage()
-    }));
+    let short_id = decode_hex_8(
+        "--sid",
+        &sid.unwrap_or_else(|| {
+            eprintln!("缺少 --sid");
+            usage()
+        }),
+    );
 
     // 认证必须成对出现：只设一半几乎总是配置错误，静默降级成「无认证」
     // 会把一个本意是受保护的代理变成开放代理。
@@ -313,16 +316,23 @@ pub(crate) fn decode_base64url_32(s: &str) -> [u8; 32] {
 }
 
 /// 解 shortId（hex）。不足 8 字节时右侧补 0，与 Xray 的语义一致。
-pub(crate) fn decode_hex_8(s: &str) -> [u8; 8] {
+///
+/// `flag` 只用于报错文案：客户端叫 `--sid`，服务端叫 `--short-ids`。
+/// 报错里指错参数名比不报错更费时间 —— 用户会去改一个根本没有问题的参数。
+pub(crate) fn decode_hex_8(flag: &str, s: &str) -> [u8; 8] {
     let mut out = [0u8; 8];
+    if !s.len().is_multiple_of(2) {
+        eprintln!("{flag} 的 {s:?} 是奇数个 hex 字符，无法成字节");
+        std::process::exit(2);
+    }
     let n = s.len() / 2;
     if n > 8 {
-        eprintln!("--sid 过长（{} 个 hex 字符，最多 16）", s.len());
+        eprintln!("{flag} 的 {s:?} 过长（{} 个 hex 字符，最多 16）", s.len());
         std::process::exit(2);
     }
     for i in 0..n {
         let b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
-            eprintln!("--sid 含非 hex 字符：{:?}", &s[i * 2..i * 2 + 2]);
+            eprintln!("{flag} 含非 hex 字符：{:?}", &s[i * 2..i * 2 + 2]);
             std::process::exit(2)
         });
         out[i] = b;
@@ -331,11 +341,13 @@ pub(crate) fn decode_hex_8(s: &str) -> [u8; 8] {
 }
 
 /// 解 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 形式的 UUID。
-pub(crate) fn decode_uuid(s: &str) -> [u8; 16] {
+///
+/// `flag` 只用于报错文案（客户端 `--uuid` / 服务端 `--users`）。
+pub(crate) fn decode_uuid(flag: &str, s: &str) -> [u8; 16] {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
         eprintln!(
-            "--uuid 格式不对：去掉连字符后应为 32 个 hex 字符，实际 {}",
+            "{flag} 的 {s:?} 格式不对：去掉连字符后应为 32 个 hex 字符，实际 {}",
             hex.len()
         );
         std::process::exit(2);
@@ -343,7 +355,7 @@ pub(crate) fn decode_uuid(s: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     for i in 0..16 {
         out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
-            eprintln!("--uuid 含非 hex 字符：{:?}", &hex[i * 2..i * 2 + 2]);
+            eprintln!("{flag} 含非 hex 字符：{:?}", &hex[i * 2..i * 2 + 2]);
             std::process::exit(2)
         });
     }
@@ -515,7 +527,7 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
     let shared = Rc::new(Shared {
         server: args.server.clone(),
         tls: tls.clone(),
-        uuid: decode_uuid(&args.uuid),
+        uuid: decode_uuid("--uuid", &args.uuid),
         socks_user: args.socks_user.clone(),
         socks_pass: args.socks_pass.clone(),
         handshake_timeout_secs: args.handshake_timeout_secs,
@@ -697,17 +709,20 @@ mod tests {
     #[test]
     fn hex_short_id_pads_to_eight_bytes() {
         assert_eq!(
-            decode_hex_8("64f6ffd42769a12c"),
+            decode_hex_8("--sid", "64f6ffd42769a12c"),
             [0x64, 0xf6, 0xff, 0xd4, 0x27, 0x69, 0xa1, 0x2c]
         );
         // 短 shortId 右侧补零
-        assert_eq!(decode_hex_8("abcd"), [0xab, 0xcd, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            decode_hex_8("--sid", "abcd"),
+            [0xab, 0xcd, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
     fn uuid_decodes_with_dashes() {
         assert_eq!(
-            decode_uuid("b21e29c8-a8ea-40a2-b953-c2b04d73d775"),
+            decode_uuid("--uuid", "b21e29c8-a8ea-40a2-b953-c2b04d73d775"),
             [
                 0xb2, 0x1e, 0x29, 0xc8, 0xa8, 0xea, 0x40, 0xa2, 0xb9, 0x53, 0xc2, 0xb0, 0x4d, 0x73,
                 0xd7, 0x75

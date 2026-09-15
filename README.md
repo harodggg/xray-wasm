@@ -51,10 +51,16 @@ kubectl rollout status deploy/xray-wasm-server
 kubectl get svc xray-wasm-server        # EXTERNAL-IP 就是节点 IP，端口 8443
 
 # 3) 断言：外部探测者必须看到 XT_DEST 的真实证书，而不是我们伪造的
-echo | openssl s_client -connect <节点IP>:8443 -servername <伪装域名> 2>&1 \
-  | grep -E 'subject=|a:PKEY:'
-#   期望：subject 里的 CN = 伪装域名，且 a:PKEY: EC (prime256v1)
-#   如果看到 PKEY: ED25519 —— 说明回退没生效，服务端正在对探测者暴露自己
+#    注意不要解析 openssl 的人类可读输出 —— macOS(LibreSSL) 与 Ubuntu(OpenSSL 3)
+#    的排版不同（`CN=` vs `CN = `、`a:PKEY: EC` vs `id-ecPublicKey`），
+#    在一边通过、在另一边红。把证书取出来做结构化判定：
+echo | openssl s_client -connect <节点IP>:8443 -servername <伪装域名> 2>/dev/null \
+  | openssl x509 -noout -subject -nameopt RFC2253
+#   期望：subject=CN=<伪装域名>
+echo | openssl s_client -connect <节点IP>:8443 -servername <伪装域名> 2>/dev/null \
+  | openssl x509 -noout -pubkey | openssl pkey -pubin -text -noout
+#   期望：prime256v1（dest 的真实 EC 公钥）
+#   若出现 ED25519 —— 说明回退没生效，服务端正在对探测者暴露自己
 
 # 4) 断言：客户端能真的出去
 curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https://example.com

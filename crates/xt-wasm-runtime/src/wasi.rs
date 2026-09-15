@@ -236,21 +236,14 @@ impl AsyncWrite for NetStream {
         match this.output.check_write() {
             // 0 表示当前写不进去：注册就绪后挂起，不空转。
             Ok(0) => {
-                // `check_write()` 报 0 时**不能只等** —— 实测（V24）它在一条新建的、
-                // 一个字节都没写过的连接上就恒为 0，而纯 wstd 的最小复现器同样会因此
-                // 以 ~18k 次/秒空转把一核吃满。
-                //
-                // 这里改用 WASI 的阻塞版写：若 `check_write()==0` 只是**误报**，
-                // 它会立刻写成功；若真的写不进，它会阻塞（代价是单线程实例被卡住，
-                // 但那比确定性的忙等要好，且有 livenessProbe 兜底）。
-                let k = buf.len().min(16 * 1024);
-                match this.output.blocking_write_and_flush(&buf[..k]) {
-                    Ok(()) => Poll::Ready(Ok(k)),
-                    Err(StreamError::Closed) => {
-                        Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-                    }
-                    Err(e) => Poll::Ready(Err(wasi_err(e))),
+                if this
+                    .write_ready
+                    .poll(&|| this.output.subscribe(), cx)
+                    .is_pending()
+                {
+                    return Poll::Pending;
                 }
+                Poll::Ready(Ok(0))
             }
             Ok(n) => {
                 let k = (n as usize).min(buf.len());
@@ -269,18 +262,19 @@ impl AsyncWrite for NetStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        // 与 `poll_write` 同样的理由（见那里的说明）：`write_ready` 的就绪判定在
-        // wasmtime 上会**误报未就绪**，若在此挂起就会变成 ~18k 次/秒的忙等。
-        // `blocking_flush` 直接把它落盘/发出，不做就绪门控。
-        match this.output.blocking_flush() {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(StreamError::Closed) => {
-                Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-            }
-            Err(e) => Poll::Ready(Err(wasi_err(e))),
+        if let Err(e) = this.output.flush() {
+            return Poll::Ready(Err(wasi_err(e)));
         }
+        if this
+            .write_ready
+            .poll(&|| this.output.subscribe(), cx)
+            .is_pending()
+        {
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {

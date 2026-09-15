@@ -426,6 +426,18 @@ cargo test --workspace        # 100 passed（cli 16 / runtime 8 / tls 37 / vless
 分析版本 `a2be4de1c315daa22e53ad1118538936241d592f`；
 每个移植文件头部保留了出处声明，上游许可证见 `LICENSE.meow-rs`。
 
-REALITY **服务端**（`reality_server.rs`、VLESS 入站解码、入站编排）为本工程原创，
-无上游可移植 —— 上游 `xtls/reality` 是一个 15,584 行的 Go 包（本质是 `crypto/tls`
-的完整 fork），`meow-rs` 明确声明 client-only，crates.io 上也没有可用的 REALITY 服务端 crate。
+REALITY **服务端**（`reality_server.rs`、VLESS 入站解码、入站编排）是本工程自己写的，
+代码没有从任何上游复制 —— 上游 `xtls/reality` 是一个 15,584 行的 Go 包（本质是
+`crypto/tls` 的完整 fork），本工程移植的 `meow-rs` 明确声明 client-only。
+
+> **更正（2026-09）**：本文件此前写着「crates.io 上也没有可用的 REALITY 服务端 crate」，
+> **这是错的**。[`shoes`](https://github.com/cfal/shoes)（`cfal/shoes`，crates.io 上可拉）
+> 是一个 Rust 多协议代理**服务端**，含完整的 REALITY 入站
+> （`src/reality/reality_server_connection.rs`、`reality_certificate.rs`、`reality_auth.rs`），
+> 也有 `examples/reality_basic.yaml` 这种服务端配置示例；另有 `undead-undead/xray-lite`
+> 等 Rust 实现。所以「本工程是唯一的非 Go REALITY 服务端」不成立。
+>
+> 本工程与之的**实际差别只有一条**：`shoes` 依赖 `aws-lc-rs`（含 C/汇编）+ tokio + h2，
+> 编译不到 `wasm32-wasip2`；本工程整条链路是纯 Rust + WASI，因此能作为**能力受限的
+> wasm 组件**跑在 wasmtime 下。这是部署形态的差别，不是实现首创性的差别。
+> 想在自己的 Rust 程序里嵌入 REALITY，`shoes` 比本工程更成熟、协议更全，优先用它。

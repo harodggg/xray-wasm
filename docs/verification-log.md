@@ -1505,3 +1505,41 @@ trait 面** —— 那是一次重构，不是一次修改。
 
 **注意**：上面两条都还没做。V24 到此为止的所有结论都是**实测**的，
 但**这个 bug 仍然没有修复**。不要把它当成已解决。
+
+### V24 九续：第二刀 —— **只用我们的 NetStream（无协议层）→ 不自旋**
+
+按上一轮的建议做的第二个最小复现器：
+`crates/xt-wasm-runtime/examples/stream_spin_probe.rs`
+（`listen` + `accept` + 每个连接起任务 `read`，**不含 TLS/VLESS 任何代码**）。
+
+```
+纯 wstd（accept + 挂起 read）                     0 ticks
+纯 wstd（accept + 挂起 connect）                  0 ticks
+我们的 NetStream（accept + 挂起 read，无协议层）   0 ticks   ← 本次
+我们的完整服务端（协议层 + 300 条悬停 connect）    501 ticks
+```
+
+**结论：我们的 socket 层单独用是正常的。自旋必须有协议层参与。**
+
+这把嫌疑从 socket 层**彻底摘掉**，同时也说明了为什么前面 5 个「在 `Ready` 里改来改去」
+的假设全部无效 —— **问题不在 `Ready` 本身的写法，而在协议层怎么用它。**
+
+## 协议层与最小复现器的差别（下一个该查的点）
+
+协议层在同一个 `NetStream` 之上做的事，最小复现器一件都没做：
+
+1. **握手期间对同一条流反复读写**（ClientHello / ServerHello / 证书 / Finished），
+   `read` 与 `write` 交替，注册/注销 waker 很多次；
+2. **把流包进多层**：`RealityTlsStream` → `serve_inbound` 里的 `decode_request`
+   → 可能还有 `timeout(...)`；（本仓库的 `timeout` 用 `futures::future::select`
+   把两个 future 塞进**同一个 task**）
+3. 一条流上**同时存在多个等待者**（读方向与写方向、外层 TLS 与内层 VLESS）。
+
+最可疑的是第 2 条：`timeout` 的 `select` 会把被包裹的 future 与 `Timer` 放在同
+一个 task 里轮询。而 **`Ready` 只有一颗 `WaitFor` 槽位** —— 若同一条流上先后有
+不同 future 来注册，waker 会被互相覆盖，留下失效注册。这正好是「运行时不背锅、
+socket 层不背锅、只有协议层参与才发作」的形状。
+
+**下一步**：在 `stream_spin_probe` 上**逐条加上协议层的特征**（先只加一层
+`timeout(...)` 包住 read，再加读写交替），看加到哪一步开始自旋。
+这是第三刀，也是最可能直接定位的一刀。

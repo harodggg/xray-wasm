@@ -77,6 +77,12 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 3. **节点时钟必须准。** REALITY 校验客户端时间戳，超出 `XT_MAX_TIME_DIFF`（默认 60 秒）
    即认证失败。虚拟机从挂起恢复后时钟漂移是「昨天还好好的」的头号原因。
 
+> **如果你手上是一份现成的 Xray 服务端配置**，迁移前先看它有没有 `shortIds: [""]`。
+> 有的话本服务端**起不来**（空 shortId 无法表达，理由见
+> [「空 shortId」](#空-shortid一个容易搞反的语义以及我们的取舍)）。
+> 注意 `shortIds: [""]` 在 Xray 里的含义是「接受 shortId 为空的客户端」，
+> **不是**「放行所有客户端」——生态里不少文档把这句写错了。
+
 ---
 
 ## 获取
@@ -163,7 +169,7 @@ xt-wasm-cli server --private-key <base64url> --short-ids <hex[,hex...]> \
 | 参数 | 环境变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
 | `--private-key` | `XT_PRIVATE_KEY` | ✅ | | X25519 **私钥**（base64url，`xray x25519` 的 `PrivateKey`） |
-| `--short-ids` | `XT_SHORT_IDS` | ✅ | | 逗号分隔的 shortId（hex）。**空列表直接拒绝启动** |
+| `--short-ids` | `XT_SHORT_IDS` | ✅ | | 逗号分隔的 shortId（hex，≤16 字符）。**空列表直接拒绝启动**；见下方「空 shortId 无法表达」 |
 | `--server-names` | `XT_SERVER_NAMES` | ✅ | | 逗号分隔的 SNI 白名单。必须与 `dest` 指向同一站点 |
 | `--dest` | `XT_DEST` | ✅ | | 认证失败时原样转发的目标 `host:port`，应是真实 TLS 站点 |
 | `--users` | `XT_USERS` | ✅ | | 逗号分隔的 VLESS UUID。**空列表直接拒绝启动** |
@@ -262,6 +268,39 @@ cargo run -p xt-wasm-tls --release --example reality_server_probe -- \
 | **只支持 VLESS TCP** | 无 UDP、无 Mux、无 `xtls-rprx-vision-udp443` |
 | **single-hop，无 uTLS 服务端指纹伪装** | 证书与握手形状按 REALITY 要求构造，但不做额外的 TLS 栈指纹伪装 |
 | **并发上限 256**（`MAX_CONCURRENT_CONNS`） | 满了会等槽位而不是丢弃连接 |
+| **空 shortId 无法表达**（见下） | 从 stock Xray 迁移一份含 `shortIds: [""]` 的配置会**拒绝启动** |
+
+#### 空 shortId：一个容易搞反的语义，以及我们的取舍
+
+Xray 的 `shortIds` 是**一组 8 字节值**，不是一个「允许所有」的开关。源码里两处可以确认：
+
+```go
+// Xray-core transport/internet/reality/config.go:54
+config.ShortIds = make(map[[8]byte]bool)
+for _, shortId := range c.ShortIds {
+    config.ShortIds[*(*[8]byte)(shortId)] = true   // 字符串按 8 字节零填充后当 key
+}
+
+// XTLS/REALITY tls.go:270（服务端认证判定）
+(config.ShortIds[hs.c.ClientShortId])              // 就是一次 map 查找
+```
+
+所以 `shortIds: [""]` 注册的是 key `00 00 00 00 00 00 00 00`，含义是
+**「接受 shortId 为空的客户端」**——而**不是**「放行所有客户端」。
+一个配了 `shortIds: ["0011223344556677"]` 的服务端，遇到 shortId 为空的客户端依然会拒绝。
+
+> 这个误解在生态里是**写进注释**的。`cfal/shoes` 的
+> [`examples/reality_basic.yaml`](https://github.com/cfal/shoes/blob/master/examples/reality_basic.yaml)
+> 里写着 `# Empty string "" allows all clients (less secure but convenient)`。
+> 按上面 Xray/REALITY 的源码，这句话是不准确的。如果你在别处也看到它，以源码为准。
+
+**本工程的取舍**：`XT_SHORT_IDS` 按逗号切分时会丢掉空项，因此**没法注册那个全零 key**，
+`XT_SHORT_IDS=""` 会被当成「一个都没配」并拒绝启动。后果是：
+从 stock Xray 迁移配置时，若原配置里有 `""`，本服务端起不来（报错明确，不会静默）。
+
+这是**刻意的**：全零 shortId 意味着任何知道公钥的人都能通过 REALITY 认证，
+只靠 UUID 兜底。我们选择让这种配置必须显式改成真实 shortId 而不是默认放行。
+如果你的部署确实依赖空 shortId，**当前版本不支持**，请继续用 stock Xray。
 
 ---
 
@@ -366,6 +405,63 @@ curl --proxy socks5h://…
 
 ---
 
+## 本工程在 REALITY 生态里的位置
+
+### 先说不成立的说法
+
+**本工程不是「REALITY 的第二个实现」，也不是唯一的非 Go 实现。** 生态里已有的实现：
+
+| 语言 | 项目 | 方向 |
+|---|---|---|
+| Go | [XTLS/Xray-core](https://github.com/XTLS/Xray-core) + [XTLS/REALITY](https://github.com/XTLS/REALITY) | 客户端 + 服务端（**事实标准**） |
+| Go | sing-box、mihomo | 客户端 + 服务端 |
+| Rust | [`shoes`](https://github.com/cfal/shoes)（crates.io 可拉） | **客户端 + 服务端**，`src/reality/` 下 `reality_server_connection.rs` / `reality_certificate.rs` / `reality_auth.rs` 齐全 |
+| Rust | [meow-rs](https://github.com/meow-rs/meow-rs) | 客户端（本工程客户端部分的移植来源） |
+| Rust | [undead-undead/xray-lite](https://github.com/undead-undead/xray-lite) | Reality + XHTTP |
+
+所以「独立实现」这个职能生态里早就有人在提供。
+**要在自己的 Rust 程序里嵌入 REALITY，用 `shoes`** —— 它更成熟、协议更全（Vision、h2/h3、更多协议）、
+已经在 crates.io 上。本工程在这件事上没有优势。
+
+> 本文件早先写过「没有任何现成的 Rust REALITY 服务端可以移植」「crates.io 上也没有可用的
+> REALITY 服务端 crate」，**那两句是错的**，已更正。错误来源也值得记下来：
+> 当时只做了 crates.io 关键词搜索 + 采信 `meow-rs` 自己的 "client-only" 声明，
+> 然后把「我没搜到」当成了「不存在」。
+> 这和本项目自己反复强调的 **「能被自己解析 ≠ 是合法的编码」** 是同一个错误形状 ——
+> 只不过这次是「在自己的检索范围里找不到 ≠ 不存在」。
+
+### 那本工程的实际差别是什么
+
+**部署形态，只有这一条**：本工程整条链路是纯 Rust + WASI 组件，
+可以编译成 `wasm32-wasip2` 跑在 wasmtime 下，guest 拿不到文件系统、起不了进程、
+开不了未授权的 socket。`shoes` 依赖 `aws-lc-rs`（含 C/汇编）+ tokio + h2，编译不到 wasip2；
+Go 那几家同理。这是**能力边界**上的差别，不是实现首创性的差别。
+
+### 关于「唯一」这个措辞：一次检索，以及它的边界
+
+上面这条差别我做过一次检索，**结论是「未找到反例」，不是「已证明唯一」**。
+方法和查询词都写在这里，你可以自己复跑、也可以推翻它：
+
+```sh
+gh search code 'wasm32-wasip2 reality'      # 无结果
+gh search code 'wasm32-wasip2 vless'        # 无结果
+gh search code 'wasm32-wasip2 TcpListener'  # 无结果
+gh search code 'wasm32-wasip2'              # 有结果，但都是工具链/文档/客户端
+curl -sS 'https://crates.io/api/v1/crates?q=reality'   # 无第二个服务端
+```
+
+**这个方法的已知边界（所以别把它当成证明）**：
+
+* GitHub code search 只索引公开仓库的默认分支，私有仓库、非默认分支、
+  未被索引的文件都看不到；
+* 它按文件内容匹配，一个项目完全可能用了 wasip2 而从不在文件里写这个字符串；
+* 没有覆盖 GitLab / Codeberg / 自建 Gitea 等非 GitHub 托管。
+
+所以正确表述是：**到目前为止没有找到第二个把 REALITY 入站做成 WASI 组件的实现**。
+如果这对你的决策重要，请自己再查一遍 —— 这篇文档不替你做这个保证。
+
+---
+
 ## 已知限制（诚实清单）
 
 | 限制 | 影响 | 说明 |
@@ -430,14 +526,6 @@ REALITY **服务端**（`reality_server.rs`、VLESS 入站解码、入站编排�
 代码没有从任何上游复制 —— 上游 `xtls/reality` 是一个 15,584 行的 Go 包（本质是
 `crypto/tls` 的完整 fork），本工程移植的 `meow-rs` 明确声明 client-only。
 
-> **更正（2026-09）**：本文件此前写着「crates.io 上也没有可用的 REALITY 服务端 crate」，
-> **这是错的**。[`shoes`](https://github.com/cfal/shoes)（`cfal/shoes`，crates.io 上可拉）
-> 是一个 Rust 多协议代理**服务端**，含完整的 REALITY 入站
-> （`src/reality/reality_server_connection.rs`、`reality_certificate.rs`、`reality_auth.rs`），
-> 也有 `examples/reality_basic.yaml` 这种服务端配置示例；另有 `undead-undead/xray-lite`
-> 等 Rust 实现。所以「本工程是唯一的非 Go REALITY 服务端」不成立。
->
-> 本工程与之的**实际差别只有一条**：`shoes` 依赖 `aws-lc-rs`（含 C/汇编）+ tokio + h2，
-> 编译不到 `wasm32-wasip2`；本工程整条链路是纯 Rust + WASI，因此能作为**能力受限的
-> wasm 组件**跑在 wasmtime 下。这是部署形态的差别，不是实现首创性的差别。
-> 想在自己的 Rust 程序里嵌入 REALITY，`shoes` 比本工程更成熟、协议更全，优先用它。
+> 但**「自己写的」不等于「唯一的」**。服务端方向生态里另有 `shoes` 等实现，
+> 本工程与它们的实际差别只在部署形态。见上面
+> [「本工程在 REALITY 生态里的位置」](#本工程在-reality-生态里的位置)一节。

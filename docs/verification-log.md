@@ -901,3 +901,81 @@ $ ./scripts/e2e-server-test.sh
   「服务端已记下认证通过，但 curl 侧没等到响应」。现在允许 3 次尝试，
   但**把重试次数打印出来** —— 悄悄重试会掩盖真实的间歇性故障，
   而那正是端到端测试最该抓的东西。
+
+---
+
+## V22 · 对交付文档里两处事实性断言的复查（一处被推翻）
+
+V21 之后我在两份 README 里写过两个关于**外部世界**的断言。
+复查下来一个被推翻，一个只能降级为「未找到反例」。记在这里，因为
+「怎么知道的」和结论本身同样重要。
+
+### 被推翻的：「crates.io 上没有可用的 REALITY 服务端 crate」
+
+**错的。** [`shoes`](https://github.com/cfal/shoes) 是 Rust 多协议代理**服务端**，
+就在 crates.io 上，含完整 REALITY 入站：
+
+```
+src/reality/reality_server_connection.rs
+src/reality/reality_server_handler.rs
+src/reality/reality_certificate.rs
+src/reality/reality_auth.rs
+examples/reality_basic.yaml          ← 服务端配置示例，含 min_client_version/max_client_version
+```
+
+另有 `undead-undead/xray-lite` 等 Rust 实现。所以「本工程是唯一的非 Go REALITY 服务端」
+不成立，**已从 README 删除并改写**。
+
+**错误是怎么产生的**（比错误本身更值得记）：当时的依据只有两条 ——
+crates.io 关键词搜索，加上采信 `meow-rs` 自己的 "no server-side features" 声明。
+然后「我没搜到」被当成了「不存在」，并且在后续总结里语气还加强了一档。
+
+这与本项目反复强调的 **「能被自己解析 ≠ 是合法的编码」**（V19）是**同一个错误形状**，
+只是对象从「我的解析器」换成了「我的检索」。教训：
+
+> **在自己的检索范围内找不到 ≠ 不存在。**
+> 负向断言（「没有 X」）需要写出**检索方法和它的边界**，否则它不可复核。
+
+### 被降级的：「REALITY 的第二个实现带来了一批此前无法证伪的协议结论」
+
+四条发现逐条复查后，**没有一条够得上「此前无法证伪」**：
+
+| 发现 | 实际来源 | 复查结论 |
+|---|---|---|
+| 纯 X25519 被接受、不需要 ML-KEM | 实测服务端日志 | **已知**。`shoes` 同样用纯 X25519 |
+| server flight 合并进一条记录 | 调试 10 秒超时 | **是 meow-rs 的实现 bug**，不是协议发现：RFC 8446 本来就允许合并，正确的 reader 不该假设一消息一记录 |
+| 服务端确实校验 `ClientVer` | 读 `xtls/reality` 源码 | 断言确实错了，但**源码里写着**，且 `shoes` 把 `min_client_version` 直接暴露成配置项 |
+| 伪造证书必须是结构完整的 X.509 | 官方客户端回 `bad_certificate`（`02 2a`） | 四条里最接近真发现的一条，但 `shoes` 有 `reality_certificate.rs`，至少有第二个人处理过 |
+
+四条事实本身仍然**真实且可复现**，作为工程记录有价值。但「独立实现」这个职能
+生态里早有 Go 的 Xray/sing-box/mihomo 与 Rust 的 shoes/meow-rs/xray-lite 在提供，
+本工程没有给这一项增加什么。
+
+### 复查中的副产品：`shortIds: [""]` 的语义被生态文档写错了
+
+从**权威源码**核实（两处，交叉验证）：
+
+```go
+// Xray-core transport/internet/reality/config.go:54
+config.ShortIds = make(map[[8]byte]bool)
+for _, shortId := range c.ShortIds {
+    config.ShortIds[*(*[8]byte)(shortId)] = true   // 字符串零填充成 8 字节当 key
+}
+
+// XTLS/REALITY tls.go:270（服务端认证判定）
+(config.ShortIds[hs.c.ClientShortId])              // 就是一次 map 查找
+```
+
+`shortIds` 是**一组 8 字节值**，不是开关。所以 `shortIds: [""]` 注册的是全零 key，
+含义是「接受 shortId 为空的客户端」，**不是**「放行所有客户端」。
+
+而 `shoes` 的 `examples/reality_basic.yaml` 里写着
+`# Empty string "" allows all clients (less secure but convenient)` ——
+按上面源码，这句话不准确。
+
+**对本工程的实际影响**（已写进 README 的已知限制）：`XT_SHORT_IDS` 的逗号切分会丢掉空项，
+因此**没法注册那个全零 key**，含 `shortIds: [""]` 的 Xray 配置迁移过来会拒绝启动。
+已实测三种输入确认行为：`""` 拒绝、`","` 拒绝、`"0011223344556677,,aabbccdd"` 正常启动（空项被丢弃）。
+
+这是刻意的取舍（全零 shortId 意味着任何知道公钥的人都能通过 REALITY 认证），
+但它是**与 stock Xray 的功能差异**，此前没写下来，现在写了。

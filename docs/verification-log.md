@@ -1278,3 +1278,38 @@ reactor 里留着已失效的 waker，`poll_oneoff` 每轮立刻返回 ⇒ 忙�
 在 `Ready::poll`、`poll_read` 循环顶、`poll_write`、`accept`、`spawn_task`、以及
 wstd 的 `block_on` 外层各放一个「每秒采样一次并打印增量」的看门狗，
 一次跑出「到底哪个计数器在涨」。只有先确认热路径，后面的修改才有意义。
+
+### V24 三续：看门狗给出的冷热判定（**这是目前最可靠的一条定位**）
+
+改用「时间门控看门狗」——由热路径自己驱动、每秒汇总一次，避免定时任务在紧循环里
+永远没机会跑：
+
+```
+[WD] read_top=20480          ← 连续 200+ 秒，每秒正好 20480 次
+[WD] write=50 flush=48 accept=160 spawn_task=159 accept_loop=159   ← 只在开头出现
+read_empty ≈ 26（全程）
+```
+
+结论：
+
+* **热路径唯一是 `poll_read` 的循环。** 写路径、`accept`、`spawn_task`、accept 循环
+  **全部排除**（首秒之后就归零）。
+* `read_empty` 全程只有 26 ⇒ **`input.read()` 几乎没被调用过** ⇒ 绝大多数轮询都停在
+  `read_ready.poll` 那一步并返回 `Pending`。
+* 也就是说：**这个连接任务的 future 在被以 ~20,480 Hz 重新轮询，而它每次都诚实地
+  回答「还没就绪」。** 所以缺陷不在读逻辑本身（`poll_read` 的行为是对的），
+  而在**是谁在不停地唤醒它** —— waker / reactor 那一侧。
+
+修正一处：`probe::hit(0)`（`Ready::poll`）这次**没插进去**（替换没匹配上），
+所以上面没有 `Ready::poll` 这一行；但 `poll_read` 循环顶紧接着就调用 `Ready::poll`，
+两者必然同量级。
+
+**至此可以确定的两件事**（都已实测）：
+
+1. 不是 `wstd` / `wasmtime`（两个纯 wstd 复现器都是 0 ticks）。
+2. 热循环是 `poll_read` 的就绪等待，**任务被 ~20kHz 虚假唤醒**；不是读逻辑、不是写路径、不是 accept。
+
+**下一步**：给 `Ready::poll` 加「Pending / Ready 各多少次」的双计数。
+若 Pending 占绝对多数却仍被高频重轮询，就证明唤醒来自**我们这个 pollable 之外**
+（例如同进程里另一个 pollable 的事件 wake 到了共用 waker），
+那就要往 wstd reactor 的 `wakers` 映射与 `ready_list` 去查 —— 而不是再动协议代码。

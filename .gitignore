@@ -36,3 +36,8 @@
 # 编辑器与系统
 .DS_Store
 *.swp
+
+# 自旋回归测试（scripts/e2e-spin-test.sh）的运行产物
+/.e2e-spin-server.log
+/.e2e-spin-xray.log
+/.e2e-spin-client.json

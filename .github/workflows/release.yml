@@ -19,6 +19,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 与 ci.yml 同理：CARGO_* 与 XW_* 必须指向同一处，否则缓存静默失效。
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
   XW_CARGO_HOME: ${{ github.workspace }}/.cargo-home
   XW_TARGET_DIR: ${{ github.workspace }}/target
   WASMTIME_VERSION: v48.0.2

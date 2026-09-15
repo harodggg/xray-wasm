@@ -14,8 +14,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # 与本地 scripts/env.sh 保持一致；用 XW_* 显式覆盖，
-  # 让 cargo 缓存落在 runner 的标准路径上以便被 actions/cache 命中。
+  # 这两组变量必须指向**同一个地方**：
+  #   CARGO_*   给直接调用的 cargo 用（build job 没有 source env.sh）
+  #   XW_*      给 env.sh 用（e2e job 里脚本会 source 它，见 scripts/env.sh）
+  # 只设其中一组的话，cargo 的落点与缓存路径会不一致，缓存静默失效。
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
   XW_CARGO_HOME: ${{ github.workspace }}/.cargo-home
   XW_TARGET_DIR: ${{ github.workspace }}/target
   WASMTIME_VERSION: v48.0.2
@@ -71,9 +75,15 @@ jobs:
 
       - name: 生产代码不得引用 tokio runtime
         run: |
-          # tokio 的 net/time/rt 等在 wasm 上是 compile_error! 或不可用。
+          # tokio 的 net/time/rt 等在 wasm 上是 compile_error! 或不可用，
           # 只允许 io-util 的 trait 与工具。
-          if grep -rnE 'tokio::(net|time|spawn|runtime|fs|process|signal)' crates/*/src/; then
+          #
+          # 必须排除**注释行**：文档里为了解释「为什么不能用 tokio::net」
+          # 会提到它。第一版检查没排除注释，结果 CI 红在自己的说明文字上。
+          hits=$(grep -rnE 'tokio::(net|time|spawn|runtime|fs|process|signal)' crates/*/src/ \
+                 | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
             echo "::error::生产代码里出现了 tokio runtime 调用"
             exit 1
           fi

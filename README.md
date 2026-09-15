@@ -243,18 +243,30 @@ REALITY 有两个方向，本工程只实现了其中**一个**：
 | 4 | **服务端侧 REALITY 认证** —— ECDH → HKDF → AES-GCM 解密 `session_id` → 校验版本 / 时钟窗口 / shortId | ✅ **已完成** |
 | 2 | **每连接伪造临时 ed25519 证书** —— 客户端校验的是 `HMAC-SHA512(authKey, 证书公钥) == 证书签名域`，所以服务端要**用 HMAC 冒充签名字段** | ✅ **已完成** |
 | 3 | **X.509 DER 编码** —— 手工拼 TBSCertificate + 伪造的 signatureValue | ✅ **已完成** |
-| 1 | **完整的 TLS 1.3 服务端握手** —— ServerHello / EncryptedExtensions / Certificate / CertificateVerify / Finished 的服务端构造与服务端密钥调度 | ⬜ 未开始 |
+| 1 | **完整的 TLS 1.3 服务端握手** —— ServerHello / EncryptedExtensions / Certificate / CertificateVerify / Finished 的服务端构造与服务端密钥调度 | ✅ **已完成** |
 | 5 | **VLESS 服务端解码 + Vision 服务端流控** —— 现有的是编码方向（客户端），解码方向在移植时被排除了 | ⬜ 未开始 |
 | 6 | **`dest` 回退** —— 认证失败的连接必须**原样转发**到真实站点，让主动探测者看到真实网站 | ⬜ 未开始 |
 
-已完成的三个阶段的代码在 `crates/xt-wasm-tls/src/reality_server.rs`，
-验证过程见 [`docs/verification-log.md`](docs/verification-log.md) 的 **V18**。
-其中最有力的一条是**跨实现**的：拿**官方 Xray 客户端真实发出的 ClientHello**
-（chrome 指纹、1787 字节、带 GREASE、三份 key_share）当夹具，
-我们的服务端能解析并认证通过，还原出 shortId 与客户端版本。
+已完成阶段的代码在 `crates/xt-wasm-tls/src/reality_server.rs`，
+验证过程见 [`docs/verification-log.md`](docs/verification-log.md) 的 **V18 / V19**。
 
-> 顺带确认了一件事：官方 chrome 指纹**同时**发纯 X25519 key_share
-> （不是只有 X25519MLKEM768），所以服务端不必实现 ML-KEM 就能取到共享密钥。
+**跨实现验证已经跑通**：让**官方 Xray 客户端**连我们的服务端，结果是它
+认可了 REALITY 认证、接受我们的 CertificateVerify 真签名，我们的服务端解出了
+它发来的 VLESS 请求头（UUID / `flow=xtls-rprx-vision` / TCP / `example.com:443`）。
+可一键复现：
+
+```sh
+cargo run -p xt-wasm-tls --release --example reality_server_probe -- \
+    4042424242424242424242424242424242424242424242424242424242424242 \
+    deadbeef00112233 www.cloudflare.com 18450
+```
+
+> 这一步踩了个只对着自己测永远发现不了的坑：第一版证书的 issuer / validity /
+> signatureAlgorithm 都是空 SEQUENCE，我们自己的解析器能过，官方客户端直接回
+> `bad_certificate`。**能被自己解析 ≠ 是合法的编码。**
+
+> 另外确认：官方 chrome 指纹**同时**发纯 X25519 key_share，
+> 所以服务端不必实现 ML-KEM 就能取到共享密钥。
 
 参考：上游 `xtls/reality` 是一个 **15,584 行的 Go 包**（本质是 `crypto/tls` 的完整 fork），
 服务端相关逻辑主要在其中。**没有任何现成的 Rust 实现可以移植** ——

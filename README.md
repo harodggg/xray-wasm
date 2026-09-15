@@ -158,12 +158,27 @@ curl --proxy socks5h://…
 
 | 限制 | 影响 | 说明 |
 |---|---|---|
-| **一次只处理一条连接** ⚠️ | 长连接会独占进程，其它客户端排队；k8s 里影响更大 | wasip2 无线程，当前是顺序 accept。k8s 缓解手段见 [`deploy/k8s/README.md`](deploy/k8s/README.md)。根治需改成非阻塞多路复用，**这是下一步最值得做的事** |
+| **建连仍是阻塞的** | 服务端不可达时会短暂阻塞其它连接 | Rust 在 wasip2 上没给非阻塞 connect 的接口。同机/局域网毫秒级，仅影响建连这一小段；握手与转发全程非阻塞 |
+| **轮询式调度，无就绪通知** | 空闲时仍有周期性唤醒 | 没有接 `wasi:io/poll`。有连接时 1ms 轮询、空闲 10ms，是延迟与 CPU 的折中 |
 | **TLS 指纹非浏览器形状** | 功能可用，但抗 JA3/JA4 与主动探测弱于官方客户端 | 手写 ClientHello 未实现 uTLS 的 Chrome 伪装 |
-| **executor 是重试式** | 空闲时有空转开销 | 非 `wasi:io/poll` 就绪通知 |
 | **无 XTLS-Vision DIRECT splice** | 仅性能差异，不影响连通 | 功能路径完整 |
 | **无 UDP / Mux / 后量子** | QUIC / HTTP3 经此代理不可用 | ML-KEM、ML-DSA-65、`VlessPacketConn` 均未实现 |
 | **无 SOCKS5 UDP ASSOCIATE / BIND** | 仅支持 CONNECT | 对验证协议栈无增量价值 |
+
+### 并发
+
+wasip2 没有线程，但**支持非阻塞 socket**，因此实现为**单线程多路复用**：
+所有连接作为 future 放在一个集合里统一推进，谁有数据就推进谁。
+并发上限 64（`MAX_CONCURRENT_CONNS`），超出后暂停 accept，新连接留在内核 backlog。
+
+一条 keep-alive 长连接**不会**再独占代理。这一点有 A/B 对照实测：
+
+| 实现 | 长连接占用期间的新请求 |
+|---|---|
+| 顺序 accept（修复前） | **超时失败，12s** |
+| 非阻塞多路复用（现在） | **HTTP 200，1s** |
+
+详见 [`docs/verification-log.md`](docs/verification-log.md) V16。
 
 ---
 

@@ -10,6 +10,7 @@
 # 端到端测试运行时产生的日志（scripts/e2e-test.sh）
 /.e2e-server.log
 /.e2e-client.log
+/.e2e-hold.log
 
 # gen-test-server.sh 生成的一次性测试服务端（含私钥，绝不入库）
 /.test-server/

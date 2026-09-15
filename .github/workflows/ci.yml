@@ -118,8 +118,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: 安装 nc（e2e 脚本用它探测端口）
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends netcat-openbsd
+      - name: 安装 e2e 依赖（nc 探端口；python3 跑并发用例的辅助脚本）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends netcat-openbsd python3
 
       - name: 下载 wasmtime
         run: |

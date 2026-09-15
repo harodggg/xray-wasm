@@ -378,3 +378,69 @@ proxy/vless/inbound: received request for tcp:api.ipify.org:443
 | 全工作区测试 | `cargo test --workspace` | **59 passed / 0 failed** |
 | wasm 产物体积 | — | **284.7 KB** |
 | 产物类型 | magic bytes | `0d 00 01 00` = **component model（wasip2）** |
+
+---
+
+## V16 · 并发修复：从「顺序 accept」到「非阻塞多路复用」
+
+### 问题
+
+早期实现是顺序 accept（wasip2 无线程）：
+
+```rust
+loop {
+    let (local, peer) = listener.accept()?;   // 阻塞
+    handle_connection(local, ...)?;           // 处理到结束才回来
+}
+```
+
+一条 **keep-alive 长连接就会独占整个进程**，其它客户端全部排队。作为 k8s 共享出口
+代理基本不可用 —— k8s 的 TCP 探针也会因此超时。这是当时文档里列为「最值得下一步做」的限制。
+
+### 前提验证
+
+动手前先确认三件事，都实测过：
+
+| 前提 | 结果 |
+|---|---|
+| `TcpListener::set_nonblocking` 在 wasip2 可用 | ✅ 连做 3 次 `accept` 全部立即返回 `WouldBlock`，总用时 **43µs** |
+| 给 future 加墙钟超时可行 | ✅ `Instant` 可用；用 `futures::future::select` + 一个只含 `Instant` 的 `Deadline`，**无需任何 unsafe 的 pin 投影** |
+| `TcpListener` 有 `set_read_timeout` | ❌ 不存在（那是 `TcpStream` 的方法）—— 所以只能走非阻塞 |
+
+### 改动
+
+1. **`xt-wasm-runtime`**：新增 `timeout()`。socket 是非阻塞的，读操作**永远不会自己失败**，
+   没有墙钟超时的话，一个「连上不发数据」的客户端会永久占住一个并发槽位，
+   攒满上限就把代理彻底堵死。
+2. **`socks5.rs`**：协商从阻塞 `Read`/`Write` 改为 `AsyncRead`/`AsyncWrite`。
+   协商逻辑一字未改，只是能被打断。测试也从「真实 socket + 线程」改为
+   「`tokio::io::duplex` 内存管道 + `join!`」—— 与目标平台一样不需要线程。
+3. **`main.rs`**：非阻塞 accept + 连接集合统一轮询（`MAX_CONCURRENT_CONNS = 64`，
+   超出后暂停 accept，新连接留在内核 backlog）。空闲时让出 10ms，有在途连接时 1ms。
+
+### A/B 对照（决定性证据）
+
+用**同一个并发用例**分别打新旧实现：先建立一条「已建隧道但一直不发数据」的长连接，
+然后在它存活期间发起一个正常请求。
+
+| 实现 | 长连接占用期间的新请求 |
+|---|---|
+| **v0.1.0（顺序 accept）** | **超时/失败，耗时 12s** ❌ |
+| **修复后（多路复用）** | **HTTP 200，耗时 1s** ✅ |
+
+用例本身带防自欺检查：断言长连接进程在请求完成时**仍然存活**
+（`kill -0`），否则「并发通过」可能只是因为它已经结束了。
+
+### 残留的阻塞点（如实记录）
+
+`xt_wasm_runtime::connect` 仍是阻塞的 —— Rust 在 wasip2 上没给非阻塞 connect 的接口
+（标准库内部自己做非阻塞 connect + poll，但不暴露出来）。所以「连服务端」这一步会
+短暂阻塞整个循环：同机/局域网是毫秒级，但服务端不可达时会阻塞到 TCP 超时。
+REALITY 握手本身及之后的全过程都是非阻塞的，影响仅限建连这一小段。
+
+### 复现
+
+```sh
+./scripts/gen-test-server.sh && . .test-server/params.env
+XW_XRAY_DIR=$PWD/.test-server ./scripts/e2e-test.sh   # 第 7 步即并发用例
+```

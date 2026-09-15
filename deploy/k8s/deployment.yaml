@@ -2,9 +2,8 @@
 #
 # 前置：先创建 Secret（见 secret.example.yaml）
 #
-# ⚠️ 关于并发的重要说明，部署前请务必读 deploy/k8s/README.md 的「已知限制」：
-# 当前实现一次只处理一条连接（wasip2 无线程）。replicas 设 2 以上可以让
-# 不同客户端落在不同 Pod 上，是目前缓解该限制的主要手段。
+# 实现是单线程非阻塞多路复用（wasip2 无线程），并发上限 64，一条长连接不会独占 Pod。
+# 仍建议先读 deploy/k8s/README.md 的「已知限制」。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,6 +11,8 @@ metadata:
   labels:
     app.kubernetes.io/name: xray-wasm
 spec:
+  # 单个 Pod 已能处理最多 64 条并发连接；replicas ≥2 的意义在于
+  # 可用性（滚动更新不中断）与横向扩容，而不是绕开单连接限制。
   replicas: 2
   selector:
     matchLabels:
@@ -51,22 +52,26 @@ spec:
               containerPort: 1080
               protocol: TCP
           # 探针说明：
-          # 因为一次只处理一条连接，探针连接可能排在正在进行的隧道后面而超时。
-          # 所以这里刻意把 failureThreshold 放宽、周期拉长 —— 目标是「发现真正卡死」
-          # 而不是「流量一大就重启」。startupProbe 负责确认监听已起来。
+          # 实现是非阻塞多路复用的，探针连接不会排在长连接后面，所以三个探针都能正常用。
+          # 探针本身会占用一个并发槽位（上限 64），可忽略；并配有 XT_HANDSHAKE_TIMEOUT
+          # 兜底，即使探针连上不发数据也会被及时回收。
           startupProbe:
             tcpSocket:
               port: socks
             periodSeconds: 2
             failureThreshold: 30
-          # 不设 livenessProbe：单连接模型下它更容易误杀而不是发现真问题。
-          # 这也是当前实现的限制之一，详见 README。
+          livenessProbe:
+            tcpSocket:
+              port: socks
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             tcpSocket:
               port: socks
             periodSeconds: 10
             timeoutSeconds: 3
-            failureThreshold: 6
+            failureThreshold: 3
           resources:
             requests:
               cpu: 20m

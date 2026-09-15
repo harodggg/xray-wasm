@@ -9,3 +9,4 @@ description = "wasip2 runtime bridge: blocking sockets adapted to async traits"
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+futures = { workspace = true }

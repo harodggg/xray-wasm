@@ -12,6 +12,13 @@
 //! 这也和官方客户端基准（`client.json` 里的 socks 入站 1080）完全对齐，
 //! 所以移植结果可以和官方实现**用同一条命令、同一套参数**对拍。
 //!
+//! # 为什么是 async 的
+//!
+//! 协商过程跑在**非阻塞** socket 上，由 `main.rs` 的多路复用器统一轮询。
+//! 如果这里用阻塞读，一条连接在协商阶段就能卡住整个进程的所有连接 ——
+//! 那正是多路复用要解决的问题。所以这里全部走 `AsyncRead`/`AsyncWrite`，
+//! 并由调用方套一层超时（非阻塞读自己永远不会失败）。
+//!
 //! # 认证不是可选项，而是安全问题
 //!
 //! 一个**无认证**的 SOCKS5 代理一旦绑到非回环地址，就是**开放代理**：
@@ -26,7 +33,9 @@
 //! 只实现 CONNECT。不支持 BIND / UDP ASSOCIATE —— 它们对「验证协议栈是否正确」
 //! 没有增量价值，却会显著放大代码量。
 
-use std::io::{self, Read, Write};
+use std::io;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// SOCKS5 版本号。
 const VER: u8 = 5;
@@ -73,18 +82,18 @@ pub enum Request {
 }
 
 /// 完成方法协商（含可选的用户名/密码认证），然后读一条请求。
-///
-/// 协商阶段用的是**阻塞** IO：此时隧道还没建立，没有并发的读写要照顾，
-/// 阻塞写法最简单也最不容易错。
-pub fn negotiate_and_read_request<S: Read + Write>(
+pub async fn negotiate_and_read_request<S>(
     sock: &mut S,
     creds: Option<Credentials<'_>>,
-) -> io::Result<Request> {
-    negotiate_method(sock, creds)?;
+) -> io::Result<Request>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    negotiate_method(sock, creds).await?;
 
     // ── 请求 ──
     let mut req = [0u8; 4];
-    sock.read_exact(&mut req)?;
+    sock.read_exact(&mut req).await?;
     if req[0] != VER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -98,24 +107,24 @@ pub fn negotiate_and_read_request<S: Read + Write>(
     let host = match atyp {
         ATYP_IPV4 => {
             let mut b = [0u8; 4];
-            sock.read_exact(&mut b)?;
+            sock.read_exact(&mut b).await?;
             std::net::Ipv4Addr::from(b).to_string()
         }
         ATYP_IPV6 => {
             let mut b = [0u8; 16];
-            sock.read_exact(&mut b)?;
+            sock.read_exact(&mut b).await?;
             std::net::Ipv6Addr::from(b).to_string()
         }
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
-            sock.read_exact(&mut len)?;
+            sock.read_exact(&mut len).await?;
             let mut b = vec![0u8; len[0] as usize];
-            sock.read_exact(&mut b)?;
+            sock.read_exact(&mut b).await?;
             // SOCKS5 的域名不保证是合法 UTF-8，但真实场景都是。
             String::from_utf8_lossy(&b).into_owned()
         }
         other => {
-            write_reply_reject(sock, REP_ADDRESS_TYPE_NOT_SUPPORTED)?;
+            write_reply_reject(sock, REP_ADDRESS_TYPE_NOT_SUPPORTED).await?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("不支持的地址类型：{other}"),
@@ -124,11 +133,11 @@ pub fn negotiate_and_read_request<S: Read + Write>(
     };
 
     let mut port_b = [0u8; 2];
-    sock.read_exact(&mut port_b)?;
+    sock.read_exact(&mut port_b).await?;
     let port = u16::from_be_bytes(port_b);
 
     if cmd != CMD_CONNECT {
-        write_reply_reject(sock, REP_COMMAND_NOT_SUPPORTED)?;
+        write_reply_reject(sock, REP_COMMAND_NOT_SUPPORTED).await?;
         return Ok(Request::Unsupported { cmd });
     }
 
@@ -136,12 +145,12 @@ pub fn negotiate_and_read_request<S: Read + Write>(
 }
 
 /// 方法协商 + （可选）RFC 1929 认证。
-fn negotiate_method<S: Read + Write>(
-    sock: &mut S,
-    creds: Option<Credentials<'_>>,
-) -> io::Result<()> {
+async fn negotiate_method<S>(sock: &mut S, creds: Option<Credentials<'_>>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut head = [0u8; 2];
-    sock.read_exact(&mut head)?;
+    sock.read_exact(&mut head).await?;
     if head[0] != VER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -150,44 +159,47 @@ fn negotiate_method<S: Read + Write>(
     }
     let nmethods = head[1] as usize;
     let mut methods = vec![0u8; nmethods];
-    sock.read_exact(&mut methods)?;
+    sock.read_exact(&mut methods).await?;
 
     match creds {
         // 未配置认证：走 0x00。调用方负责警告「非回环且无认证」的风险。
         None => {
             if !methods.contains(&METHOD_NO_AUTH) {
-                sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE])?;
-                sock.flush()?;
+                sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE]).await?;
+                sock.flush().await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "客户端不支持「无认证」方式",
                 ));
             }
-            sock.write_all(&[VER, METHOD_NO_AUTH])?;
-            sock.flush()?;
+            sock.write_all(&[VER, METHOD_NO_AUTH]).await?;
+            sock.flush().await?;
             Ok(())
         }
         // 配置了认证：只接受 0x02，绝不回退到无认证。
         Some(want) => {
             if !methods.contains(&METHOD_USER_PASS) {
-                sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE])?;
-                sock.flush()?;
+                sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE]).await?;
+                sock.flush().await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "服务端要求认证，但客户端未提供用户名/密码方式",
                 ));
             }
-            sock.write_all(&[VER, METHOD_USER_PASS])?;
-            sock.flush()?;
-            verify_user_pass(sock, want)
+            sock.write_all(&[VER, METHOD_USER_PASS]).await?;
+            sock.flush().await?;
+            verify_user_pass(sock, want).await
         }
     }
 }
 
 /// RFC 1929：`VER(1) ULEN UNAME PLEN PASSWD`，应答 `VER(1) STATUS(1)`。
-fn verify_user_pass<S: Read + Write>(sock: &mut S, want: Credentials<'_>) -> io::Result<()> {
+async fn verify_user_pass<S>(sock: &mut S, want: Credentials<'_>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut ver = [0u8; 1];
-    sock.read_exact(&mut ver)?;
+    sock.read_exact(&mut ver).await?;
     if ver[0] != USERPASS_VER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -196,14 +208,14 @@ fn verify_user_pass<S: Read + Write>(sock: &mut S, want: Credentials<'_>) -> io:
     }
 
     let mut ulen = [0u8; 1];
-    sock.read_exact(&mut ulen)?;
+    sock.read_exact(&mut ulen).await?;
     let mut uname = vec![0u8; ulen[0] as usize];
-    sock.read_exact(&mut uname)?;
+    sock.read_exact(&mut uname).await?;
 
     let mut plen = [0u8; 1];
-    sock.read_exact(&mut plen)?;
+    sock.read_exact(&mut plen).await?;
     let mut passwd = vec![0u8; plen[0] as usize];
-    sock.read_exact(&mut passwd)?;
+    sock.read_exact(&mut passwd).await?;
 
     // 定长比较，避免因提前返回而泄漏长度信息。
     // （本场景下时序攻击价值有限，但成本几乎为零，没有理由不做。）
@@ -211,8 +223,9 @@ fn verify_user_pass<S: Read + Write>(sock: &mut S, want: Credentials<'_>) -> io:
         & constant_time_eq(&passwd, want.password.as_bytes());
 
     // 无论成败都回一条，让客户端知道结果而不是干等。
-    sock.write_all(&[USERPASS_VER, if ok { 0x00 } else { 0x01 }])?;
-    sock.flush()?;
+    sock.write_all(&[USERPASS_VER, if ok { 0x00 } else { 0x01 }])
+        .await?;
+    sock.flush().await?;
 
     if ok {
         Ok(())
@@ -240,7 +253,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// BND.ADDR/BND.PORT 填 0.0.0.0:0 —— 真实代理会填自己的出口地址，
 /// 但没有客户端会依赖这个值（`curl` 不看它）。
-pub fn write_reply_ok<S: Write>(sock: &mut S) -> io::Result<()> {
+pub async fn write_reply_ok<S: AsyncWrite + Unpin>(sock: &mut S) -> io::Result<()> {
     sock.write_all(&[
         VER,
         REP_SUCCEEDED,
@@ -252,59 +265,55 @@ pub fn write_reply_ok<S: Write>(sock: &mut S) -> io::Result<()> {
         0, // BND.ADDR
         0,
         0, // BND.PORT
-    ])?;
-    sock.flush()
+    ])
+    .await?;
+    sock.flush().await
 }
 
 /// 回一条失败应答（隧道建立失败时用，让客户端立刻知道而不是干等）。
-pub fn write_reply_failure<S: Write>(sock: &mut S) -> io::Result<()> {
-    write_reply_reject(sock, REP_GENERAL_FAILURE)
+pub async fn write_reply_failure<S: AsyncWrite + Unpin>(sock: &mut S) -> io::Result<()> {
+    write_reply_reject(sock, REP_GENERAL_FAILURE).await
 }
 
-fn write_reply_reject<S: Write>(sock: &mut S, rep: u8) -> io::Result<()> {
-    sock.write_all(&[VER, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])?;
-    sock.flush()
+async fn write_reply_reject<S: AsyncWrite + Unpin>(sock: &mut S, rep: u8) -> io::Result<()> {
+    sock.write_all(&[VER, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+        .await?;
+    sock.flush().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
 
-    /// 起一对本地连接，把 `client_side` 的输出交给被测函数。
-    fn with_pair<F>(client_side: F, creds: Option<Credentials<'static>>) -> io::Result<Request>
-    where
-        F: FnOnce(TcpStream) -> io::Result<()> + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        let h = std::thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
-            client_side(s).unwrap();
-        });
-        let mut server = TcpStream::connect(addr)?;
-        let r = negotiate_and_read_request(&mut server, creds);
-        h.join().unwrap();
-        r
+    /// 用内存管道跑一次完整协商：服务端跑被测函数，客户端跑给定的脚本，两者并发推进。
+    ///
+    /// 用内存管道而不是真实 socket：协商逻辑与传输无关，而且这样不需要线程
+    /// （wasip2 上没有线程，所以测试写法必须与目标平台一致）。
+    macro_rules! run_case {
+        ($creds:expr, |$sock:ident| $body:block) => {{
+            let (mut $sock, mut server_io) = tokio::io::duplex(16 * 1024);
+            xt_wasm_runtime::block_on(async move {
+                let (req, ()) = futures::join!(
+                    negotiate_and_read_request(&mut server_io, $creds),
+                    async move { $body }
+                );
+                req
+            })
+        }};
     }
 
     #[test]
     fn parses_domain_connect_request() {
-        let req = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 0])?; // 问候：无认证
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                assert_eq!(reply, [5, 0]);
-                // CONNECT example.com:443
-                s.write_all(&[5, 1, 0, 3, 11])?;
-                s.write_all(b"example.com")?;
-                s.write_all(&443u16.to_be_bytes())?;
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                Ok(())
-            },
-            None,
-        )
+        let req = run_case!(None, |s| {
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+            // CONNECT example.com:443
+            s.write_all(&[5, 1, 0, 3, 11]).await.unwrap();
+            s.write_all(b"example.com").await.unwrap();
+            s.write_all(&443u16.to_be_bytes()).await.unwrap();
+        })
         .unwrap();
 
         assert_eq!(
@@ -318,18 +327,13 @@ mod tests {
 
     #[test]
     fn parses_ipv4_connect_request() {
-        let req = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 0])?;
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1])?;
-                s.write_all(&8080u16.to_be_bytes())?;
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                Ok(())
-            },
-            None,
-        )
+        let req = run_case!(None, |s| {
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1]).await.unwrap();
+            s.write_all(&8080u16.to_be_bytes()).await.unwrap();
+        })
         .unwrap();
 
         assert_eq!(
@@ -343,23 +347,18 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_command_and_replies_with_correct_code() {
-        let req = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 0])?;
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                // BIND (0x02) —— 不支持
-                s.write_all(&[5, 2, 0, 1, 127, 0, 0, 1])?;
-                s.write_all(&8080u16.to_be_bytes())?;
-                // 应答的第二个字节必须是 REP_COMMAND_NOT_SUPPORTED
-                let mut reject = [0u8; 10];
-                s.read_exact(&mut reject)?;
-                assert_eq!(reject[0], 5);
-                assert_eq!(reject[1], REP_COMMAND_NOT_SUPPORTED);
-                Ok(())
-            },
-            None,
-        )
+        let req = run_case!(None, |s| {
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            // BIND (0x02) —— 不支持
+            s.write_all(&[5, 2, 0, 1, 127, 0, 0, 1]).await.unwrap();
+            s.write_all(&8080u16.to_be_bytes()).await.unwrap();
+            let mut reject = [0u8; 10];
+            s.read_exact(&mut reject).await.unwrap();
+            assert_eq!(reject[0], 5);
+            assert_eq!(reject[1], REP_COMMAND_NOT_SUPPORTED);
+        })
         .unwrap();
 
         assert_eq!(req, Request::Unsupported { cmd: 2 });
@@ -367,16 +366,12 @@ mod tests {
 
     #[test]
     fn rejects_client_without_no_auth_method() {
-        let err = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 2])?; // 只提供用户名密码认证
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
-                Ok(())
-            },
-            None,
-        )
+        let err = run_case!(None, |s| {
+            s.write_all(&[5, 1, 2]).await.unwrap(); // 只提供用户名密码认证
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
+        })
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
@@ -392,29 +387,23 @@ mod tests {
     /// 认证成功：方法协商选 0x02，凭据正确后继续到请求解析。
     #[test]
     fn accepts_correct_credentials() {
-        let req = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 2])?; // 只提供用户名密码
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                assert_eq!(reply, [5, METHOD_USER_PASS], "必须选中 0x02");
-                // RFC 1929
-                s.write_all(&[1, 5])?;
-                s.write_all(b"alice")?;
-                s.write_all(&[6])?;
-                s.write_all(b"s3cr3t")?;
-                let mut auth = [0u8; 2];
-                s.read_exact(&mut auth)?;
-                assert_eq!(auth, [1, 0x00], "认证应成功");
-                // 继续发请求
-                s.write_all(&[5, 1, 0, 3, 11])?;
-                s.write_all(b"example.com")?;
-                s.write_all(&443u16.to_be_bytes())?;
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                Ok(())
-            },
-            Some(CREDS),
-        )
+        let req = run_case!(Some(CREDS), |s| {
+            s.write_all(&[5, 1, 2]).await.unwrap(); // 只提供用户名密码
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, METHOD_USER_PASS], "必须选中 0x02");
+            // RFC 1929
+            s.write_all(&[1, 5]).await.unwrap();
+            s.write_all(b"alice").await.unwrap();
+            s.write_all(&[6]).await.unwrap();
+            s.write_all(b"s3cr3t").await.unwrap();
+            let mut auth = [0u8; 2];
+            s.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth, [1, 0x00], "认证应成功");
+            s.write_all(&[5, 1, 0, 3, 11]).await.unwrap();
+            s.write_all(b"example.com").await.unwrap();
+            s.write_all(&443u16.to_be_bytes()).await.unwrap();
+        })
         .unwrap();
 
         assert_eq!(
@@ -429,22 +418,18 @@ mod tests {
     /// 密码错误必须被拒绝，且回 0x01 而不是静默断开。
     #[test]
     fn rejects_wrong_password() {
-        let err = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 2])?;
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                s.write_all(&[1, 5])?;
-                s.write_all(b"alice")?;
-                s.write_all(&[5])?;
-                s.write_all(b"wrong")?;
-                let mut auth = [0u8; 2];
-                s.read_exact(&mut auth)?;
-                assert_eq!(auth, [1, 0x01], "认证应失败");
-                Ok(())
-            },
-            Some(CREDS),
-        )
+        let err = run_case!(Some(CREDS), |s| {
+            s.write_all(&[5, 1, 2]).await.unwrap();
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            s.write_all(&[1, 5]).await.unwrap();
+            s.write_all(b"alice").await.unwrap();
+            s.write_all(&[5]).await.unwrap();
+            s.write_all(b"wrong").await.unwrap();
+            let mut auth = [0u8; 2];
+            s.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth, [1, 0x01], "认证应失败");
+        })
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
@@ -454,40 +439,31 @@ mod tests {
     /// 也绝不能回退到无认证。
     #[test]
     fn never_falls_back_to_no_auth_when_credentials_are_configured() {
-        let err = with_pair(
-            |mut s| {
-                // 同时声明「无认证」和「用户名密码」
-                s.write_all(&[5, 2, 0, 2])?;
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                // 必须选 0x02，不能选 0x00
-                assert_eq!(
-                    reply,
-                    [5, METHOD_USER_PASS],
-                    "配置了认证却回退到无认证 = 开放代理"
-                );
-                Ok(())
-            },
-            Some(CREDS),
-        )
+        let err = run_case!(Some(CREDS), |s| {
+            // 同时声明「无认证」和「用户名密码」
+            s.write_all(&[5, 2, 0, 2]).await.unwrap();
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            // 必须选 0x02，不能选 0x00
+            assert_eq!(
+                reply,
+                [5, METHOD_USER_PASS],
+                "配置了认证却回退到无认证 = 开放代理"
+            );
+        })
         .unwrap_err();
-        // 客户端没继续发凭据就断了，报错即可
         let _ = err;
     }
 
     /// 只支持无认证的客户端，在服务端要求认证时必须被拒。
     #[test]
     fn rejects_client_that_cannot_do_user_pass() {
-        let err = with_pair(
-            |mut s| {
-                s.write_all(&[5, 1, 0])?; // 只提供「无认证」
-                let mut reply = [0u8; 2];
-                s.read_exact(&mut reply)?;
-                assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
-                Ok(())
-            },
-            Some(CREDS),
-        )
+        let err = run_case!(Some(CREDS), |s| {
+            s.write_all(&[5, 1, 0]).await.unwrap(); // 只提供「无认证」
+            let mut reply = [0u8; 2];
+            s.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
+        })
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);

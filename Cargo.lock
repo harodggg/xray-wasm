@@ -733,6 +733,7 @@ name = "xt-wasm-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "thiserror",
  "tokio",
 ]

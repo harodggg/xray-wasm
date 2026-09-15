@@ -67,31 +67,26 @@ kubectl run -it --rm curl --image=curlimages/curl --restart=Never -- \
 
 ## 已知限制（部署前请务必阅读）
 
-### 1. 一次只处理一条连接 ⚠️
+### 1. 并发是单线程多路复用
 
-wasip2 没有线程，当前实现是**顺序 accept**：一条连接处理完才接受下一条。
-后果是：
+wasip2 没有线程。当前实现是**非阻塞多路复用**：所有连接作为 future 在一个循环里
+统一推进，并发上限 64，超出后暂停 accept（新连接留在内核 backlog）。
 
-* 一个保持长连接的客户端（HTTP/2、keep-alive、长轮询）会**独占**该 Pod，
-  其它客户端连上后只能排队；
-* k8s 探针在忙时可能超时。
+一条 keep-alive 长连接**不会**再独占代理。实测 A/B 对照：
+顺序 accept 的旧实现在长连接占用期间新请求会**超时失败（12s）**，
+现在的实现同一场景下 **HTTP 200（1s）**。
 
-**当前可行的缓解**：
+仍有两点要知道：
 
-* 优先用 **sidecar** 模式（只服务本 Pod，竞争最小）；
-* 共享代理模式下把 `replicas` 设 ≥2，不同客户端会落到不同 Pod；
-* 清单里刻意**没有**配 `livenessProbe`（单连接模型下它更容易误杀），
-  `readinessProbe` 也放宽了阈值。
+* **建连是阻塞的**（Rust 在 wasip2 上没给非阻塞 connect 的接口）。服务端不可达时，
+  这一步会阻塞到 TCP 超时，期间所有连接都停住。建议把 `XT_SERVER` 指向稳定可达的地址。
+* **超出 64 条并发后**新连接会排队。共享代理模式下按需增加 `replicas`。
 
-**根治**需要把 accept 循环与 SOCKS5 协商改成非阻塞多路复用
-（`xt-wasm-runtime` 的非阻塞 socket 与 executor 已经具备条件）。
-这是本项目下一步最值得做的事。
+### 2. 探针
 
-### 2. 探针会占用连接
-
-`tcpSocket` 探针会真的建一条 TCP 连接。当前实现能靠协商超时
-（`XT_HANDSHAKE_TIMEOUT`，默认 15s）把它丢掉，不会卡死 ——
-但探针本身仍会占用一次处理机会。
+`tcpSocket` 探针会真的建一条 TCP 连接，并占用一个并发槽位（有 `XT_HANDSHAKE_TIMEOUT`
+兜底，不会永久占住）。并发上限是 64，探针占用可以忽略，所以现在清单里
+同时配了 `startupProbe`、`readinessProbe` 与 `livenessProbe`。
 
 ### 3. TLS 指纹不是浏览器形状
 

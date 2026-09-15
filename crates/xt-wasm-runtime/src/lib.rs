@@ -250,6 +250,62 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+// ─────────────────────────── 超时 ───────────────────────────
+
+/// 超时错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("操作超时")]
+pub struct Elapsed;
+
+/// 到点即就绪的 future。
+///
+/// 只含一个 `Instant`，因此天然 `Unpin`，不需要任何 unsafe 的 pin 投影。
+struct Deadline {
+    at: std::time::Instant,
+}
+
+impl Future for Deadline {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if std::time::Instant::now() >= self.at {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// 给任意 future 加一个墙钟超时。
+///
+/// # 为什么必须有它
+///
+/// socket 是**非阻塞**的：对端不发数据时读操作会一直返回 `Pending`，
+/// 永远不会自己失败。多路复用下这意味着一个「连上但不发数据」的客户端
+/// 可以永久占住一个并发槽位（k8s 的 TCP 探针、端口扫描器都会这么做），
+/// 槽位耗尽后代理就再也接不了新连接。
+///
+/// # 为什么不用 unsafe
+///
+/// `futures::future::select` 要求两个 future 都是 `Unpin`。
+/// 把内层 future `Box::pin` 之后它就是 `Unpin`，`Deadline` 本身也只含
+/// `Instant` —— 于是不需要任何 `unsafe` 的 pin 投影。
+///
+/// 返回类型写全 `std::result::Result`：本 crate 的 [`Result`] 是
+/// `TransportError` 的单参数别名，直接写 `Result<T, E>` 会撞上它。
+pub async fn timeout<F: Future>(
+    dur: Duration,
+    future: F,
+) -> std::result::Result<F::Output, Elapsed> {
+    let inner = Box::pin(future);
+    let deadline = Deadline {
+        at: std::time::Instant::now() + dur,
+    };
+    match futures::future::select(inner, deadline).await {
+        futures::future::Either::Left((value, _)) => Ok(value),
+        futures::future::Either::Right(((), _)) => Err(Elapsed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +391,33 @@ mod tests {
             matches!(poll, Poll::Pending),
             "idle read should be Pending, got {poll:?}"
         );
+    }
+
+    /// 卡住的 future 必须被超时打断 —— 这是「连上不发数据」不会占死并发槽位的前提。
+    #[test]
+    fn timeout_fires_on_a_stalled_future() {
+        let t0 = std::time::Instant::now();
+        let r = block_on(timeout(
+            Duration::from_millis(200),
+            std::future::pending::<()>(),
+        ));
+        let elapsed = t0.elapsed();
+        assert!(r.is_err(), "永不完成的 future 必须超时");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "过早触发：{elapsed:?}"
+        );
+        // 上界放得很宽：这条只用来抓「超时根本没生效、一直挂着」。
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "超时未被察觉：{elapsed:?}"
+        );
+    }
+
+    /// 已经就绪的 future 不该被超时影响。
+    #[test]
+    fn timeout_passes_through_a_ready_future() {
+        let r = block_on(timeout(Duration::from_secs(30), async { 42 }));
+        assert_eq!(r.unwrap(), 42);
     }
 }

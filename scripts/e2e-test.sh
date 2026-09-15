@@ -57,7 +57,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> 1/7 确保 stock Xray REALITY 服务端在跑"
+echo "==> 1/8 确保 stock Xray REALITY 服务端在跑"
 if nc -z 127.0.0.1 8443 2>/dev/null; then
     pass "服务端已在 127.0.0.1:8443"
 else
@@ -73,7 +73,7 @@ else
     pass "已启动服务端（pid ${SERVER_PID}）"
 fi
 
-echo "==> 2/7 启动 wasm 客户端（SOCKS5 + 认证）"
+echo "==> 2/8 启动 wasm 客户端（SOCKS5 + 认证）"
 XT_SOCKS_USER="$SOCKS_USER" XT_SOCKS_PASS="$SOCKS_PASS" \
 XT_HANDSHAKE_TIMEOUT="$HANDSHAKE_TIMEOUT" \
 "$XW_DIR/scripts/run-local.sh" \
@@ -97,20 +97,20 @@ if ! grep -q "认证：用户名/密码" "$XW_DIR/.e2e-client.log"; then
 fi
 pass "客户端已启用认证"
 
-echo "==> 3/7 安全属性：不带凭据必须被拒（否则就是开放代理）"
+echo "==> 3/8 安全属性：不带凭据必须被拒（否则就是开放代理）"
 if curl -sS -m 10 --proxy "socks5h://$SOCKS" -o /dev/null https://example.com 2>/dev/null; then
     fail "无凭据竟然连通了 —— 认证没有生效，这是开放代理！"
 fi
 pass "无凭据被拒绝"
 
-echo "==> 4/7 错误凭据必须被拒"
+echo "==> 4/8 错误凭据必须被拒"
 if curl -sS -m 10 --proxy-user "testuser:wrongpass" --proxy "socks5h://$SOCKS" \
         -o /dev/null https://example.com 2>/dev/null; then
     fail "错误密码竟然连通了"
 fi
 pass "错误凭据被拒绝"
 
-echo "==> 5/7 经隧道取一个真实页面（带正确凭据）"
+echo "==> 5/8 经隧道取一个真实页面（带正确凭据）"
 CODE=$(proxy_curl -o /dev/null -w '%{http_code}' https://example.com 2>&1) || {
     echo "--- 客户端日志 ---" >&2; cat "$XW_DIR/.e2e-client.log" >&2
     fail "curl 失败"
@@ -118,7 +118,7 @@ CODE=$(proxy_curl -o /dev/null -w '%{http_code}' https://example.com 2>&1) || {
 [ "$CODE" = "200" ] || fail "期望 HTTP 200，实际 $CODE"
 pass "https://example.com -> $CODE"
 
-echo "==> 6/7 半开连接不得永久卡死代理（k8s 探针 / 端口扫描器会这样）"
+echo "==> 6/8 半开连接不得永久卡死代理（k8s 探针 / 端口扫描器会这样）"
 # 连上但不发任何数据，保持 6 秒；协商超时是 ${HANDSHAKE_TIMEOUT}s
 ( sleep 6 | nc 127.0.0.1 1080 >/dev/null 2>&1 ) &
 STALL_PID=$!
@@ -128,7 +128,43 @@ kill "$STALL_PID" 2>/dev/null || true
 [ "$CODE" = "200" ] || fail "半开连接之后代理未能恢复（拿到 $CODE）—— 顺序 accept 被卡死了"
 pass "半开连接超时后被丢弃，代理已恢复"
 
-echo "==> 7/7 出口 IP 应与直连不同"
+echo "==> 7/8 并发：一条长连接不得独占代理（多路复用是否真的生效）"
+# 起一条「已建立隧道但一直不发数据」的长连接。顺序 accept 的实现会被它独占到结束，
+# 多路复用的实现则不受影响 —— 这条用例就是用来区分这两种实现的。
+python3 "$XW_DIR/scripts/hold-tunnel.py" \
+    127.0.0.1 1080 "$SOCKS_USER" "$SOCKS_PASS" example.com 443 8 \
+    >"$XW_DIR/.e2e-hold.log" 2>&1 &
+HOLD_PID=$!
+
+# 等它真正占住隧道（脚本握手成功会打印 HELD）
+i=0
+while [ "$i" -lt 40 ]; do
+    grep -q HELD "$XW_DIR/.e2e-hold.log" 2>/dev/null && break
+    i=$((i + 1))
+    sleep 0.1
+done
+if ! grep -q HELD "$XW_DIR/.e2e-hold.log" 2>/dev/null; then
+    cat "$XW_DIR/.e2e-hold.log" >&2
+    kill "$HOLD_PID" 2>/dev/null || true
+    fail "长连接未能建立（hold-tunnel.py 没有报 HELD）"
+fi
+# 确认它此刻仍然活着 —— 否则「并发通过」可能只是因为它已经结束了
+kill -0 "$HOLD_PID" 2>/dev/null || fail "长连接在测试前就已退出，用例无效"
+
+T0=$(date +%s)
+CODE=$(proxy_curl -o /dev/null -w '%{http_code}' https://example.com 2>&1) || CODE='000'
+T1=$(date +%s)
+ELAPSED=$((T1 - T0))
+# 再确认一次：长连接在我们测试期间还活着，才说明真的是并发
+STILL_ALIVE=no
+kill -0 "$HOLD_PID" 2>/dev/null && STILL_ALIVE=yes
+kill "$HOLD_PID" 2>/dev/null || true
+wait "$HOLD_PID" 2>/dev/null || true
+[ "$CODE" = "200" ] || fail "长连接存在时新请求失败（拿到 $CODE）—— 代理被独占了"
+[ "$STILL_ALIVE" = "yes" ] || fail "长连接在请求完成前已退出，无法证明并发"
+pass "长连接占用期间新请求仍成功（${ELAPSED}s，长连接全程存活）"
+
+echo "==> 8/8 出口 IP 应与直连不同"
 EGRESS=$(proxy_curl https://api.ipify.org 2>&1 | head -1)
 pass "隧道出口 IP：$EGRESS"
 

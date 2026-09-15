@@ -120,10 +120,14 @@ xray-wasm/
 
 1. **TLS 指纹仍是手写形状**，未实现 uTLS 的 Chrome 伪装（见 §7 风险表）。
    功能可用，但抗 JA3/JA4 与主动探测能力弱于官方客户端。
-2. **executor 是重试式**（`Poll::Pending` 时空转重试），非 `wasi:io/poll` 就绪通知。
-   单连接顺序处理，无并发；高延迟下有空转开销。
-3. **未实现 XTLS-Vision 的 DIRECT splice 性能优化**（功能正确，仅性能差异）。
-4. **未做 UDP / Mux / 后量子（ML-KEM、ML-DSA-65）**，均在范围内明确排除。
+2. **建连仍是阻塞的**：Rust 在 wasip2 上没有非阻塞 connect 接口，连服务端这一步
+   会短暂阻塞多路复用循环（同机毫秒级；不可达时阻塞到 TCP 超时）。
+3. **调度是轮询式的**（`Poll::Pending` 时让出重试），未接 `wasi:io/poll` 就绪通知。
+4. **未实现 XTLS-Vision 的 DIRECT splice 性能优化**（功能正确，仅性能差异）。
+5. **未做 UDP / Mux / 后量子（ML-KEM、ML-DSA-65）**，均在范围内明确排除。
+
+> 并发已不再是限制：实现已改为**非阻塞多路复用**（并发上限 64），
+> A/B 实测见 `docs/verification-log.md` V16。
 
 ---
 

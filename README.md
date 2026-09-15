@@ -4,8 +4,10 @@
 编译成 **wasm32-wasip2**，在 **wasmtime** 下跑真实的 TCP 代理。
 可作为本地 SOCKS5 代理，也可部署到 Kubernetes。
 
-> **仅客户端（出站）**：本工程连接到已有的 REALITY 服务端，**不提供 REALITY 服务端
-> （入站）**。入站能不能做、要做什么，见 [「REALITY 入站」](#reality-入站服务端尚未实现)一节。
+> **方向：只做了「socket → REALITY」，没做「REALITY → socket」。**
+> 本工程是**客户端**：把本地明文流封装进 REALITY 隧道送出去。
+> 它不做服务端，即不能接住 REALITY 连接再解封装。
+> 后者用官方 Xray 服务端就能做到（见 [「REALITY 入站」](#reality-入站服务端尚未实现)一节）。
 
 > **能用，且已对着真实 Xray 服务端端到端验证过。**
 > 验证过程与原始输出见 [`docs/verification-log.md`](docs/verification-log.md)。
@@ -197,12 +199,31 @@ wasip2 没有线程，但支持非阻塞 socket。实现为**单线程协作式�
 
 ## REALITY 入站（服务端）：**尚未实现**
 
-本工程目前**只实现了客户端（出站）**：连接到一个已有的 REALITY 服务端并把流量送出去。
-它**不能**作为 REALITY 服务端接受连接。
+### 一句话：只做了「socket → REALITY」，没做「REALITY → socket」
 
-这一节记录「能不能做、要做什么」，以免反复被问到或产生误解。
+REALITY 有两个方向，本工程只实现了其中**一个**：
 
-### 技术上可行吗？可行，但是一个独立的大工程
+| 方向 | 干什么 | 对应角色 | 本工程 |
+|---|---|---|---|
+| **socket → REALITY** | 把本地明文流**封装**进 REALITY 隧道送出去 | 客户端（出站） | ✅ **已实现** |
+| **REALITY → socket** | 接住 REALITY 连接、**解封装**成明文再送往目标 | 服务端（入站） | ❌ **未实现** |
+
+本工程的 SOCKS5 入站是**明文**的（那是给本机程序用的），它出去的那一侧才是 REALITY。
+所以它能把明文变成 REALITY，不能把 REALITY 变回明文。
+
+### 但这不代表「REALITY → socket」做不到
+
+**官方 Xray 服务端做的就是这件事**，而且本工作区的
+[`xray-deploy/install-xray.sh`](../xray-deploy/install-xray.sh) 已经能一键部署它：
+服务端配置就是 `inbound: vless + reality` + `outbound: freedom` ——
+接住 REALITY、解封装、再直连目标。装完还会直接用官方客户端自测一遍并输出分享链接。
+
+换句话说：**这个方向今天就能用，只是不在本工程里，而是官方实现。**
+本工程缺的不是「能不能」，是「用 Rust 在 wasm 里重写一遍」——见下。
+
+### 为什么用 Rust 重写是另一个大工程
+
+这一节记录「要做什么」，以免反复被问到或产生误解。
 
 **wasm 运行时已经不是障碍。** 这项能力所需的基础设施本工程都已具备并有实测：
 

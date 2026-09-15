@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -228,6 +228,16 @@ pub async fn sleep(dur: Duration) {
     while std::time::Instant::now() < deadline {
         yield_now().await;
     }
+}
+
+/// 解析 `host:port` 到一组地址。
+///
+/// 与 `connect` 拆开是为了让调用方能**分别报告**「解析失败」和「连不上」——
+/// 这两件事的排查方向完全不同（域名/DNS vs 对端端口/防火墙），
+/// 混成一句 `connect failed` 等于把排障成本推给运维。
+pub fn resolve(addr: &str) -> io::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok(addr.to_socket_addrs()?.collect())
 }
 
 /// 建立连接（宿主侧走阻塞 connect）。

@@ -36,7 +36,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use wasip2::io::streams::{InputStream, OutputStream, StreamError};
 use wasip2::sockets::network::{Ipv4SocketAddress, Ipv6SocketAddress};
-use wasip2::sockets::tcp::{IpAddressFamily, IpSocketAddress, TcpSocket};
+use wasip2::sockets::tcp::{IpAddressFamily, IpSocketAddress, ShutdownType, TcpSocket};
 use wstd::__internal::wasip2;
 use wstd::runtime::{AsyncPollable, WaitFor};
 
@@ -146,8 +146,24 @@ impl NetStream {
     ///
     /// 注意：WASI 的 `tcp-socket` 只能整体 shutdown，没有半关闭。
     /// 想只关写方向只能靠 drop 整个流，所以这里返回 `Ok(())` 表示「尽力而为」。
+    /// 关掉**写方向**，向对端发 FIN，但保留读方向。
+    ///
+    /// # 这里曾经是个 `Ok(())` 空实现，后果很严重
+    ///
+    /// 空实现意味着**半关闭永远不会传播给对端**。而 `relay_bidirectional`
+    /// 的收尾恰恰完全依赖它：某个方向读到 EOF 后 `shutdown` 对端写方向，
+    /// 让对端也知道「我这边说完了」。
+    ///
+    /// 空实现之下这条链根本走不完：客户端关掉写方向 → 我们没发 FIN →
+    /// 服务端读不到 EOF → 它那边的 `a_to_b` 永远挂着 → 中继永远不返回。
+    /// 实测症状是每条连接都在服务端留下一个 `CLOSE_WAIT` 的目标 socket 和
+    /// 一个 `ESTABLISHED` 的客户端 socket，**请求成功、连接不回收** ——
+    /// 长跑就是一个 fd 泄漏，同时也让「连接结束时记账」的日志永远不出现。
+    ///
+    /// WASI 的 `OutputStream` 没有 shutdown；要发 FIN 得用底层的
+    /// `tcp-socket.shutdown(Send)` —— 这正是本结构体持有 `socket` 的原因之一。
     fn shutdown_write(&self) -> io::Result<()> {
-        Ok(())
+        self.socket.shutdown(ShutdownType::Send).map_err(wasi_err)
     }
 }
 
@@ -327,11 +343,13 @@ fn family_of(addr: std::net::SocketAddr) -> IpAddressFamily {
     }
 }
 
-/// 建立连接。支持 IP 字面量与域名。
+/// 解析 `host:port` 到一组地址。
 ///
-/// 连接本身是**非阻塞**的：`start_connect` 立即返回，完成由 pollable 通知。
+/// 与 `connect` 拆开是为了让调用方能**分别报告**「解析失败」和「连不上」——
+/// 这两件事的排查方向完全不同（域名/DNS vs 对端端口/防火墙），
+/// 混成一句 `connect failed` 等于把排障成本推给运维。
 ///
-/// # DNS 是一个残留的阻塞点
+/// # 这是一个残留的阻塞点
 ///
 /// `std::net::ToSocketAddrs` 在 wasip2 上是**同步**的（内部走
 /// `wasi:sockets/ip-name-lookup`，但 std 不暴露它的 pollable 版本），
@@ -339,10 +357,17 @@ fn family_of(addr: std::net::SocketAddr) -> IpAddressFamily {
 /// 服务端连目标站时拿到的是域名，因此这一项在服务端路径上确实会命中 ——
 /// 记为已知限制，后续可换用 `ip-name-lookup` 的异步接口。
 /// 解析需要 wasmtime 打开 `-S allow-ip-name-lookup=y`。
-pub async fn connect(addr: &str) -> io::Result<NetStream> {
+pub fn resolve(addr: &str) -> io::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
+    Ok(addr.to_socket_addrs()?.collect())
+}
 
-    let resolved: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+/// 建立连接。支持 IP 字面量与域名。
+///
+/// 连接本身是**非阻塞**的：`start_connect` 立即返回，完成由 pollable 通知。
+/// 解析的部分见 [`resolve`]（那里的阻塞说明同样适用）。
+pub async fn connect(addr: &str) -> io::Result<NetStream> {
+    let resolved = resolve(addr)?;
     let mut last_err = None;
     for sa in resolved {
         match connect_addr(sa).await {

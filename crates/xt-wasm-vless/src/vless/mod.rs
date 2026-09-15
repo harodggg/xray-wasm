@@ -16,6 +16,6 @@ pub use conn::VlessConn;
 pub use header::{addr_from_metadata, Cmd, VlessAddr};
 pub use server::{
     decode_request, serve_inbound, serve_inbound_with_events, InboundConfig, InboundEvent,
-    InboundOutcome, Request,
+    InboundOutcome, InboundReport, Request,
 };
 pub use vision::VisionConn;

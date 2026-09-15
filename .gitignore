@@ -21,6 +21,12 @@
 /.e2e-srv-bad.log
 /.e2e-srv-bad.json
 
+# wasm↔wasm 方向（scripts/e2e-wasm-to-wasm-test.sh）
+/.e2e-w2w-srv.log
+/.e2e-w2w-cli.log
+/.e2e-w2w-cli-env.log
+/.e2e-w2w-cli-bad.log
+
 # gen-test-server.sh 生成的一次性测试服务端（含私钥，绝不入库）
 /.test-server/
 

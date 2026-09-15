@@ -73,6 +73,16 @@ struct Args {
     /// 没有超时的话，任何一个「连上但不发数据」的客户端（k8s 存活探针、
     /// 端口扫描器、半开连接）都会把整个代理永久卡住。
     handshake_timeout_secs: u64,
+    /// 不发 XTLS-Vision flow 声明，也不做客户端侧 Vision 分帧。
+    ///
+    /// **指向本工程的 wasm 服务端时必须开**：服务端侧的 Vision 流控尚未实现，
+    /// 请求里带非空 flow 会被明确拒绝。
+    ///
+    /// 注意这不只是「请求头少两个字节」：Vision 的客户端侧会把**最初的负载
+    /// 包进填充帧**，而本工程的服务端不做拆帧，会把那些填充字节当成原始数据
+    /// 转发给目标站 —— 结果是「连上了但数据是坏的」。所以 `--no-flow` 必须
+    /// **同时**关掉 flow 声明和 `VisionConn` 包装。
+    no_flow: bool,
     self_test: bool,
 }
 
@@ -91,10 +101,20 @@ fn usage() -> ! {
   --handshake-timeout S
                        协商阶段读超时秒数（默认 {}）。防止「连上不发数据」的连接
                        长期占住一个并发槽位。
+  --no-flow            不发 XTLS-Vision flow 声明，也不做客户端侧 Vision 分帧。
+                       **服务端是本工程的 `xt-wasm-cli server` 时必须加** ——
+                       服务端侧 Vision 流控尚未实现，带 flow 的请求会被明确拒绝。
+                       指向 stock Xray 服务端时**不要**加（Vision 是它的正常路径）。
 
 环境变量（命令行参数优先，便于 k8s 用 Secret 注入而不用写进 args）：
   XT_SERVER  XT_PBK  XT_SID  XT_SNI  XT_UUID  XT_LISTEN  XT_CLIENT_VER
-  XT_SOCKS_USER  XT_SOCKS_PASS  XT_HANDSHAKE_TIMEOUT  XT_SELF_TEST",
+  XT_SOCKS_USER  XT_SOCKS_PASS  XT_HANDSHAKE_TIMEOUT  XT_NO_FLOW  XT_SELF_TEST
+
+互操作（哪一端是哪个实现，决定要不要 --no-flow）：
+  wasm 客户端 --no-flow  →  wasm 服务端         ✅
+  wasm 客户端 --no-flow  →  stock Xray 服务端   ✅（flow 为空是合法配置）
+  wasm 客户端（默认）    →  stock Xray 服务端   ✅
+  wasm 客户端（默认）    →  wasm 服务端         ❌ 被明确拒绝（服务端不实现 Vision）",
         version_string(RealityConfig::DEFAULT_CLIENT_VERSION),
         DEFAULT_HANDSHAKE_TIMEOUT_SECS
     );
@@ -173,6 +193,7 @@ fn parse_args() -> Args {
     let mut socks_user = env_opt("XT_SOCKS_USER");
     let mut socks_pass = env_opt("XT_SOCKS_PASS");
     let mut handshake_timeout_secs = env_opt("XT_HANDSHAKE_TIMEOUT");
+    let mut no_flow = env_flag("XT_NO_FLOW");
     let mut self_test = env_flag("XT_SELF_TEST");
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -195,6 +216,7 @@ fn parse_args() -> Args {
             "--socks-user" => socks_user = Some(need(i)),
             "--socks-pass" => socks_pass = Some(need(i)),
             "--handshake-timeout" => handshake_timeout_secs = Some(need(i)),
+            "--no-flow" => no_flow = true,
             "--self-test" => self_test = true,
             "-h" | "--help" => usage(),
             other => {
@@ -202,10 +224,11 @@ fn parse_args() -> Args {
                 usage()
             }
         }
-        i += if argv[i].starts_with("--") && argv[i] != "--self-test" {
-            2
-        } else {
+        // 不带取值的开关不能多吃一个参数，否则会把后面的 flag 吞掉。
+        i += if matches!(argv[i].as_str(), "--self-test" | "--no-flow") {
             1
+        } else {
+            2
         };
     }
 
@@ -256,6 +279,7 @@ fn parse_args() -> Args {
                 })
             })
             .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
+        no_flow,
         self_test,
     }
 }
@@ -449,6 +473,8 @@ struct Shared {
     socks_user: Option<String>,
     socks_pass: Option<String>,
     handshake_timeout_secs: u64,
+    /// 见 `Args::no_flow`。
+    no_flow: bool,
 }
 
 impl Shared {
@@ -468,7 +494,7 @@ impl Shared {
 /// 建连是**真异步**的：`connect` 内部走 `start_connect` + pollable，不会阻塞其它连接。
 /// （v0.2 及以前用的是 `std::net` 的阻塞 connect，服务端不可达时会把整个代理
 /// 卡到 TCP 超时。）
-async fn open_tunnel(shared: &Shared, host: &str, port: u16) -> Result<VisionConn, String> {
+async fn open_tunnel(shared: &Shared, host: &str, port: u16) -> Result<Box<dyn Stream>, String> {
     // 域名保持域名形式交给服务端解析（socks5h 语义，也避免在 wasm 里做 DNS）。
     let addr = if let Ok(v4) = host.parse::<Ipv4Addr>() {
         VlessAddr::Ipv4(v4.octets())
@@ -494,18 +520,25 @@ async fn open_tunnel(shared: &Shared, host: &str, port: u16) -> Result<VisionCon
         .await
         .map_err(|e| format!("REALITY 握手失败：{e}"))?;
 
-    let vless = VlessConn::new_deferred(
-        tls_stream,
-        &shared.uuid,
-        Some(VISION_FLOW),
-        Cmd::Tcp,
-        port,
-        &addr,
-    )
-    .await
-    .map_err(|e| format!("VLESS 请求头发送失败：{e}"))?;
+    // flow 声明与 VisionConn 必须**同进同退**：只关掉声明却仍然做 Vision 分帧，
+    // 会把填充帧当成普通数据发给一个不做拆帧的服务端 —— 「连上了但数据是坏的」，
+    // 属于最难查的那类故障。所以这里由同一个 `no_flow` 决定两件事。
+    let flow = if shared.no_flow {
+        None
+    } else {
+        Some(VISION_FLOW)
+    };
+    let vless = VlessConn::new_deferred(tls_stream, &shared.uuid, flow, Cmd::Tcp, port, &addr)
+        .await
+        .map_err(|e| format!("VLESS 请求头发送失败：{e}"))?;
 
-    Ok(VisionConn::new(vless, shared.uuid))
+    if shared.no_flow {
+        // 不包 VisionConn：请求头会在首次写时直接发出去（`new_deferred` 的语义），
+        // 之后就是裸 VLESS 负载。
+        Ok(Box::new(vless))
+    } else {
+        Ok(Box::new(VisionConn::new(vless, shared.uuid)))
+    }
 }
 
 /// 同时处理的连接数上限。
@@ -531,7 +564,17 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
         socks_user: args.socks_user.clone(),
         socks_pass: args.socks_pass.clone(),
         handshake_timeout_secs: args.handshake_timeout_secs,
+        no_flow: args.no_flow,
     });
+
+    // 指向本工程的服务端时必须 --no-flow。这条提示放在启动日志里而不是只写在
+    // --help 里：真正会用错的人不会去读 --help，但一定会看到启动输出。
+    if !args.no_flow {
+        eprintln!(
+            "提示：当前发送 XTLS-Vision flow。若服务端是本工程的 xt-wasm-cli server \
+             （不实现 Vision 流控），请加 --no-flow 或设 XT_NO_FLOW=1，否则会被明确拒绝。"
+        );
+    }
 
     let has_auth = shared.socks_user.is_some();
     if !is_loopback_listen(&args.listen) && !has_auth {
@@ -745,6 +788,121 @@ mod tests {
         std::env::set_var("XT_TEST_EMPTY_VAR", "");
         assert!(env_opt("XT_TEST_EMPTY_VAR").is_none());
         std::env::remove_var("XT_TEST_EMPTY_VAR");
+    }
+
+    /// **`--no-flow` 必须在线上真的生效**，而且两件事要一起生效：
+    /// VLESS 请求头里的 flow 声明、以及客户端侧的 Vision 分帧。
+    ///
+    /// 这条用例走真 socket、真 REALITY 握手、真的让我们自己的服务端去解包，
+    /// 断言的是**服务端实际读到的字节**，不是某个内部布尔量 ——
+    /// 「只关掉声明却仍然做 Vision 分帧」这种一半的修法必须被抓住。
+    ///
+    /// 判据用的是服务端给出的 outcome：
+    /// * `no_flow=true`  → 服务端接受了请求，随后去连目标（目标故意指向没人听的端口），
+    ///   于是得到 `ConnectFailed`
+    /// * `no_flow=false` → 服务端在 VLESS 请求头里读到非空 flow → `Rejected{…Vision…}`
+    #[test]
+    fn no_flow_changes_what_the_server_actually_reads() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use xt_wasm_tls::{RealityConfig, RealityServerConfig};
+        use xt_wasm_vless::{serve_inbound, InboundConfig, InboundOutcome, InboundReport};
+
+        const SNI: &str = "www.cloudflare.com";
+        const SHORT_ID: [u8; 8] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+        const UUID: [u8; 16] = [0x77; 16];
+
+        // 跑一轮：起一个真监听的服务端线程，用 open_tunnel 连上去，写一点数据，
+        // 再取回服务端对这条连接的判定。
+        fn run(no_flow: bool) -> InboundOutcome {
+            let server_priv = xt_wasm_tls::test_support::fixture_private_key();
+            let server_pub = xt_wasm_tls::reality_public_key(&server_priv);
+
+            let inbound = InboundConfig {
+                reality: RealityServerConfig {
+                    private_key: server_priv,
+                    short_ids: vec![SHORT_ID],
+                    server_names: vec![SNI.to_string()],
+                    max_time_diff_secs: 60,
+                },
+                // 故意指向一个不会有人监听的端口：这样「flow 被接受」的下场是
+                // ConnectFailed，与「flow 被拒绝」的 Rejected 能清楚区分开。
+                dest: "127.0.0.1:9".to_string(),
+                users: vec![UUID],
+            };
+
+            let (addr_tx, addr_rx) = mpsc::channel::<String>();
+            let (out_tx, out_rx) = mpsc::channel::<xt_wasm_vless::Result<InboundReport>>();
+            let server = std::thread::spawn(move || {
+                let report = xt_wasm_runtime::block_on(async move {
+                    let listener = xt_wasm_runtime::listen("127.0.0.1:0").await?;
+                    addr_tx
+                        .send(listener.local_addr()?)
+                        .expect("主线程应当还在等地址");
+                    let stream = listener.accept().await?;
+                    serve_inbound(Box::new(stream), &inbound).await
+                });
+                let _ = out_tx.send(report);
+            });
+
+            let listen_addr = addr_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("服务端未能在 10 秒内绑定端口");
+
+            let shared = Shared {
+                server: listen_addr,
+                tls: TlsConfig {
+                    reality: Some(RealityConfig::new(server_pub, SHORT_ID)),
+                    ..TlsConfig::new(SNI)
+                },
+                uuid: UUID,
+                socks_user: None,
+                socks_pass: None,
+                handshake_timeout_secs: 10,
+                no_flow,
+            };
+
+            // 目标端口 1：一定有东西在监听的可能性极低，服务端会 ConnectFailed。
+            xt_wasm_runtime::block_on(async move {
+                let Ok(mut tunnel) = open_tunnel(&shared, "127.0.0.1", 1).await else {
+                    panic!("REALITY 握手/建隧道就失败了，这条用例就测不到 flow");
+                };
+                // `new_deferred` 把请求头延迟到第一次写，所以必须写一下。
+                use tokio::io::AsyncWriteExt;
+                let _ = tunnel.write_all(b"GET / HTTP/1.0\r\n\r\n").await;
+                let _ = tunnel.flush().await;
+                drop(tunnel);
+            });
+
+            let report = out_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("服务端没有给出报告")
+                .expect("服务端不应返回 Err（Err 表示服务端自己坏了）");
+            server.join().expect("服务端线程 panic");
+            report.outcome
+        }
+
+        // 带 flow（默认）：服务端必须**明确拒绝**，而不是把填充帧当数据转发出去
+        match run(false) {
+            InboundOutcome::Rejected { reason } => {
+                assert!(reason.contains("Vision"), "拒绝原因要点明 Vision：{reason}");
+            }
+            other => panic!("默认（带 Vision）时服务端应当 Rejected，实际 {other:?}"),
+        }
+
+        // 不带 flow：请求头里没有 flow，服务端放行，往后走才因为目标不可达而失败
+        match run(true) {
+            InboundOutcome::ConnectFailed { reason } => {
+                assert!(
+                    reason.contains("127.0.0.1:1"),
+                    "应当是因为连不上目标而失败：{reason}"
+                );
+            }
+            InboundOutcome::Rejected { reason } => {
+                panic!("--no-flow 之后服务端仍然拒绝了请求，说明 flow 没真的置空：{reason}")
+            }
+            other => panic!("--no-flow 时应当走到连接目标那一步，实际 {other:?}"),
+        }
     }
 
     #[test]

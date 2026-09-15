@@ -114,12 +114,21 @@ xray-wasm/
 | M4 | 硬化 | 超时/错误路径、无 `unwrap` panic、与 stock Xray 客户端对拍线格式 | ✅ **完成**（V14 对拍 `ServerHello` 127 字节与官方一致并修复 `ClientVer` 互通；V16/V17 换成非阻塞 socket + reactor 就绪通知；对拍与错误路径用例均入 CI） |
 | M5 | REALITY **入站**（服务端） | stock Xray 客户端经我们的服务端代理到真实网站；未认证探测者看到 `dest` 的真实证书 | ✅ **完成**（V18/V19/V20，六个阶段全部落地） |
 | M6 | 服务端 CLI + k3s 交付 | `server` 子命令、两个方向的 e2e 入 CI、可部署清单、发版产物 | ✅ **完成**（V21） |
+| M7 | 自环互通 + 可诊断性 | `--no-flow`（wasm↔wasm 打通）、结构化单行日志、解析/连接失败可分辨、`--check` 自检、三道 e2e 入 CI | ✅ **完成**（V22） |
 
-**验收现状**：`cargo test --workspace` → 100 passed / 0 failed；
-`./scripts/check.sh`（本地与 CI 同一条命令）全绿；
-`./scripts/e2e-test.sh`（我们的客户端 → stock 服务端）与
-`./scripts/e2e-server-test.sh`（stock 客户端 → 我们的服务端）双向通过。
-详见 `docs/verification-log.md` V13/V15/V21。
+**验收现状**：`cargo test --workspace` 全绿；
+`./scripts/check.sh`（本地与 CI 同一条命令）全绿；三道 e2e 全通过：
+
+| 脚本 | 方向 |
+|---|---|
+| `scripts/e2e-test.sh` | 我们的客户端 → stock 服务端 |
+| `scripts/e2e-server-test.sh` | stock 客户端 → 我们的服务端 |
+| `scripts/e2e-wasm-to-wasm-test.sh` | 我们的客户端 `--no-flow` → 我们的服务端（自环） |
+
+**互操作矩阵**（细节见 README）：stock→wasm ✅（flow 留空）、wasm→stock ✅、
+wasm→wasm 需 `--no-flow` ✅、wasm（默认带 Vision）→wasm ❌ 明确拒绝。
+
+详见 `docs/verification-log.md` V13/V15/V21/V22。
 
 ### 尚未完成的事项（诚实列出）
 

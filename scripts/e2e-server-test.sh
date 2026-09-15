@@ -169,13 +169,22 @@ else
 fi
 
 echo "==> 3/5 服务端确实做了转发（而不是退化成了直连）"
-# 断言的是「认证通过」那一行，它在判定做出的**当下**就写出去了。
-# 不要去等「结束：Forwarded ...」—— 那一行要等隧道关闭，测试会变成看运气。
-grep -q "认证通过 user=$UUID -> $TARGET:443" "$XW_DIR/.e2e-srv-wasm.log" || {
+# 服务端现在是**一次请求一行**的结构化日志，结局行在中继收尾之后写出，
+# 所以这里要等一小会儿（curl 拿到响应早于服务端把连接收干净）。
+#
+# `sid=` 是我们这一轮现场生成的那个 shortId，用它把日志行钉到本次连接上 ——
+# 新版日志里没有 user= 字段（契约里用 sid/ver 标识客户端配置）。
+i=0
+while [ "$i" -lt 15 ]; do
+    grep -q "sid=$SID target=$TARGET:443 outcome=Forwarded" "$XW_DIR/.e2e-srv-wasm.log" 2>/dev/null && break
+    i=$((i + 1))
+    sleep 1
+done
+grep -q "sid=$SID target=$TARGET:443 outcome=Forwarded" "$XW_DIR/.e2e-srv-wasm.log" || {
     srv_log >&2
-    fail "服务端日志里没有到 $TARGET:443 的转发记录"
+    fail "服务端日志里没有 sid=$SID 到 $TARGET:443 的 outcome=Forwarded"
 }
-pass "服务端日志：认证通过 user=$UUID -> $TARGET:443"
+pass "服务端日志：sid=$SID target=$TARGET:443 outcome=Forwarded"
 
 echo "==> 4/5 抗探测：未认证的 TLS 探测者必须看到 dest 的真实证书"
 # 判别依据：真证书是 EC (prime256v1)，我们伪造的证书是 Ed25519。
@@ -212,9 +221,15 @@ printf '%s\n' "$KEYINFO" | grep -qi "prime256v1" || {
 # 服务端也必须把这条连接记成回退（而不是当成错误吞掉）——
 # 探测流量在日志里看不见的话，运维根本无法判断自己有没有被扫。
 sleep 0.5
-grep -q "未认证" "$XW_DIR/.e2e-srv-wasm.log" || {
+i=0
+while [ "$i" -lt 15 ]; do
+    grep -q "dir=fallback .*outcome=FellBack" "$XW_DIR/.e2e-srv-wasm.log" 2>/dev/null && break
+    i=$((i + 1))
+    sleep 1
+done
+grep -q "dir=fallback .*outcome=FellBack" "$XW_DIR/.e2e-srv-wasm.log" || {
     srv_log >&2
-    fail "探测连接没有被记成未认证/回退"
+    fail "探测连接没有被记成 dir=fallback / outcome=FellBack"
 }
 pass "探测者看到 dest 的真实证书（CN=$DEST_HOST, EC），伪造证书没有泄漏"
 
@@ -235,10 +250,22 @@ if curl -sS -m 15 -o /dev/null --proxy "socks5h://127.0.0.1:$((SPORT + 1))" \
     fail "错误 UUID 竟然连通了 —— VLESS 用户名单没有生效！"
 fi
 sleep 0.5
-grep -q "失败：proxy authentication failed" "$XW_DIR/.e2e-srv-wasm.log" || {
+# 未知 UUID 现在是 `Rejected`（服务端**正常判定**的结果），不是 `Err`；
+# 原因里必须点名那个 UUID 并给出修复建议 —— 否则运维只知道「有人被拒了」。
+i=0
+while [ "$i" -lt 15 ]; do
+    grep -q "outcome=Rejected" "$XW_DIR/.e2e-srv-wasm.log" 2>/dev/null && break
+    i=$((i + 1))
+    sleep 1
+done
+grep -q "outcome=Rejected" "$XW_DIR/.e2e-srv-wasm.log" || {
     srv_log >&2
-    fail "错误 UUID 的连接没有被记成认证失败"
+    fail "错误 UUID 的连接没有被记成 outcome=Rejected"
 }
-pass "错误 UUID 被拒（服务端日志：失败：proxy authentication failed）"
+grep -q "不在服务端 users 名单里" "$XW_DIR/.e2e-srv-wasm.log" || {
+    srv_log >&2
+    fail "拒绝原因没有说清是 UUID 不在名单里"
+}
+pass "错误 UUID 被拒（outcome=Rejected，且原因点名 UUID 与 XT_USERS）"
 
 printf '\n  服务端端到端通过。\n'

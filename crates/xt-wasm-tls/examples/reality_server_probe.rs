@@ -70,7 +70,9 @@ fn main() {
         println!("PROBE_ACCEPTED");
 
         match reality_server_handshake(Box::new(stream), &cfg).await {
-            Ok(HandshakeOutcome::Authenticated { mut stream, auth }) => {
+            Ok(HandshakeOutcome::Authenticated {
+                mut stream, auth, ..
+            }) => {
                 println!(
                     "PROBE_AUTH_OK short_id={:02x?} client_ver={:?}",
                     auth.short_id, auth.client_version

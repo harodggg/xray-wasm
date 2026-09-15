@@ -433,6 +433,11 @@ pub enum HandshakeOutcome {
     Authenticated {
         stream: RealityTlsStream,
         auth: Authenticated,
+        /// ClientHello 里的 SNI。
+        ///
+        /// 带上它是为了日志：服务端要能在一行里说出「这条连接自称访问的是哪个站点」。
+        /// 认证路径此前没带，于是只剩回退路径有 SNI，日志里一半的连接是瞎的。
+        server_name: Option<String>,
     },
     /// 未通过认证。调用方应当把 `buffered` 补发给 `dest`，
     /// 然后用 `stream` 继续双向转发，让主动探测者看到真实网站。
@@ -444,6 +449,21 @@ pub enum HandshakeOutcome {
         buffered: Vec<u8>,
         server_name: Option<String>,
     },
+}
+
+/// 由服务端私钥推出对应的**公钥**（客户端要填的那个 `XT_PBK`）。
+///
+/// 存在的理由很实际：运维手里通常只有 Secret 里的私钥，而客户端配置要的是公钥。
+/// 没有这个函数时，唯一的自查办法是把私钥重新喂给 `xray x25519`（做不到 ——
+/// 它只生成新对），或者干脆猜。k8s 的配置自检正需要回答
+/// 「Secret 里的私钥，和客户端配的公钥是一对吗」。
+///
+/// 公钥不是机密：它本来就要分发给每一个客户端。
+///
+/// X25519 的 clamp 由底层标量乘法按 RFC 7748 完成，所以传入未 clamp 的
+/// 32 字节同样得到正确结果。
+pub fn reality_public_key(private_key: &[u8; 32]) -> [u8; 32] {
+    x25519_public_from_private(private_key)
 }
 
 /// 完成一次 REALITY 服务端握手。
@@ -574,7 +594,11 @@ pub async fn reality_server_handshake(
 
     // 服务端读客户端、写客户端 —— 与客户端的读写密钥正好相反
     let stream = RealityTlsStream::from_keys(inner, app.client, app.server);
-    Ok(HandshakeOutcome::Authenticated { stream, auth })
+    Ok(HandshakeOutcome::Authenticated {
+        stream,
+        auth,
+        server_name: ch.server_name.clone(),
+    })
 }
 
 /// 读一条**加密的**握手消息，跳过中间的 ChangeCipherSpec。
@@ -1052,7 +1076,7 @@ mod tests {
         });
 
         let mut server_stream = match srv.expect("服务端握手必须成功") {
-            HandshakeOutcome::Authenticated { stream, auth } => {
+            HandshakeOutcome::Authenticated { stream, auth, .. } => {
                 // 服务端应当认出这是授权客户端（而不是走 dest 回退）
                 assert_eq!(auth.short_id, SHORT_ID);
                 assert_eq!(auth.client_version, [26, 3, 27]);

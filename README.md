@@ -67,11 +67,25 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 #   期望：200
 ```
 
+### 互操作矩阵（哪两端、要不要 `--no-flow`）
+
+| 客户端 | 服务端 | 结果 |
+|---|---|---|
+| 官方 Xray（v2rayN / 小火箭 / `xray` 二进制） | 本工程 wasm 服务端 | ✅ 可用；**配置里 `flow` 必须留空** |
+| 本工程 wasm 客户端（默认，带 Vision） | 官方 Xray 服务端 | ✅ 可用（Vision 是官方服务端的正常路径） |
+| 本工程 wasm 客户端 **`--no-flow`** | 本工程 wasm 服务端 | ✅ 可用（`scripts/e2e-wasm-to-wasm-test.sh` 常态化验证） |
+| 本工程 wasm 客户端（默认，带 Vision） | 本工程 wasm 服务端 | ❌ 被**明确拒绝**（服务端不实现 Vision 流控），绝不静默降级 |
+
+> 所以**要不要 `--no-flow`，取决于服务端是谁**：指向本工程的服务端就加，
+> 指向官方 Xray 服务端就别加（加了也能用，只是放弃 Vision 的流量整形）。
+
 **必须记住的三条硬约束**（违反任一条都会得到一个「看起来在跑但不可用」的服务端）：
 
 1. **客户端 `flow` 必须留空。** 服务端的 XTLS-Vision（服务端侧流控）**尚未实现**；
    请求里带非空 flow 时服务端会**明确报错**，不会静默降级。
-   官方 Xray 客户端的 `users[].flow` 写 `""`。
+   官方 Xray 客户端的 `users[].flow` 写 `""`；
+   本工程客户端加 `--no-flow`（或 `XT_NO_FLOW=1`）—— 它同时关掉 flow 声明**和**
+   客户端侧的 Vision 分帧，两者必须同进同退（只关一半会得到「连上了但数据是坏的」）。
 2. **`XT_SERVER_NAMES` 与 `XT_DEST` 必须指向同一个真实站点。**
    否则认证失败时，探测者请求的 SNI 与拿到的证书域名对不上 —— 等于自曝。
 3. **节点时钟必须准。** REALITY 校验客户端时间戳，超出 `XT_MAX_TIME_DIFF`（默认 60 秒）
@@ -154,6 +168,7 @@ xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid>
 | `--socks-user` | `XT_SOCKS_USER` | | | SOCKS5 用户名；**与 `--socks-pass` 必须同时给出** |
 | `--socks-pass` | `XT_SOCKS_PASS` | | | SOCKS5 密码 |
 | `--handshake-timeout` | `XT_HANDSHAKE_TIMEOUT` | | `15` | 协商阶段读超时（秒） |
+| `--no-flow` | `XT_NO_FLOW` | | 关 | 不发 Vision flow 声明，也不做客户端侧 Vision 分帧。**服务端是本工程的 `server` 时必须加** |
 | `--client-ver` | `XT_CLIENT_VER` | | `26.3.27` | REALITY 上报的 ClientVer，须落在服务端 `min/maxClientVer` 区间内 |
 | `--self-test` | `XT_SELF_TEST` | | | 只做 REALITY 握手并报告耗时，不起 SOCKS5 |
 | （无参数） | `XT_MODE=server` | | | 等价于子命令 `server`，供不方便写 args 的部署使用 |
@@ -175,6 +190,7 @@ xt-wasm-cli server --private-key <base64url> --short-ids <hex[,hex...]> \
 | `--users` | `XT_USERS` | ✅ | | 逗号分隔的 VLESS UUID。**空列表直接拒绝启动** |
 | `--listen` | `XT_SERVER_LISTEN` | | `0.0.0.0:8443` | 入站监听地址（注意与客户端的 `XT_LISTEN` 不是同一个变量） |
 | `--max-time-diff` | `XT_MAX_TIME_DIFF` | | `60` | REALITY 时间戳容差（秒） |
+| `--check` | `XT_CHECK` | | 关 | **只做配置自检**：打印生效配置（私钥脱敏 + 公钥）后退出，不监听任何端口 |
 
 配置解析顺序：**环境变量打底，命令行覆盖**。所有必填项缺失时以退出码 `2` 失败并说明原因。
 
@@ -241,24 +257,76 @@ cargo run -p xt-wasm-tls --release --example reality_server_probe -- \
 
 ### 日志的形态（写给要接日志的人）
 
+**一次请求一行**，字段顺序固定：
+
 ```
-[server] REALITY 入站：监听 0.0.0.0:8443，SNI ["www.example.com"]，用户 1 个，dest www.example.com:443
-[server] 认证失败的连接会被原样转发到 dest（这是设计行为，不是漏洞）
-[server] 10.0.0.5:51234 认证通过 user=8f1c…-… -> example.com:443
-[server] 10.0.0.5:51234 未认证（sni=www.example.com），转发到 dest
-[server] 10.0.0.5:51234 结束：Forwarded { target: "example.com:443" }
-[server] 10.0.0.5:51235 失败：proxy authentication failed
+[server] ts=2026-09-15T11:41:12Z dir=in src=127.0.0.1:50388 sni=www.cloudflare.com \
+         ver=26.3.27 sid=2c3d58a3c703d187 target=example.com:443 outcome=Forwarded \
+         dur_ms=1320 up_bytes=585 down_bytes=4867
+[server] ts=… dir=fallback src=… sni=… ver=- sid=- target=www.cloudflare.com:443 \
+         outcome=FellBack dur_ms=… up_bytes=… down_bytes=…
+[server] ts=… dir=in src=… sni=… ver=26.3.27 sid=… target=www.google.com:5222 \
+         outcome=ConnectFailed dur_ms=30001 up_bytes=0 down_bytes=0 \
+         reason="连接目标 …（解析为 [142.250.x.x:5222]）失败：…；若为 remote-unreachable，…"
 ```
 
-两条设计决定，接日志/告警前请先知道：
+`outcome=` 的全部取值（见 `xt_wasm_vless::InboundOutcome`）：
 
-* **判定一出就写「认证通过 / 未认证」，不等连接结束。** 长连接可能挂几小时，
-  「断开时才记一笔」的日志在运维上没有意义。为此库层专门提供了
-  `serve_inbound_with_events`（`serve_inbound` 是它的空回调包装）。
+| 值 | 含义 | 该怎么看 |
+|---|---|---|
+| `Forwarded` | 授权用户，已转发到目标完成 | 正常 |
+| `FellBack` | 未通过 REALITY 认证，已原样转发到 `dest` | **设计行为**（探测者/扫描器），不是错误 |
+| `Rejected` | 请求被拒：UUID 不在名单 / 非 TCP / 请求了 Vision | **客户端配置问题**，`reason` 里有改法 |
+| `ResolveFailed` | 目标域名解析失败 | DNS 问题，与「端口没人听」是两回事 |
+| `ConnectFailed` | 解析到了但连不上 | 端口没开 / 被防火墙挡，`reason` 里有解析结果 |
+| `Error` | 服务端自身出错（`Err`） | 这是唯一表示「服务端坏了」的值 |
+
+注意 `Rejected` / `ResolveFailed` / `ConnectFailed` 都是 **`Ok` 而不是 `Err`**：
+服务端**正常处理完了**这条连接（包括它决定拒绝），只有 `Error` 才是服务端自己出了问题。
+这样调用方不必再从错误字符串里猜发生了什么。
+
+三条设计决定，接日志/告警前请先知道：
+
+* **一次请求一行，不配对。** 判定时的身份（`sni`/`ver`/`sid`）与结束时的结局
+  （`outcome`/`dur_ms`/字节数）合并在同一行，`grep outcome=Rejected` 一眼看出
+  是客户端配置问题，不必再人工配对两行。
+  代价要说清楚：**这一行在连接结束时才写**。若某个连接一直不收尾，
+  它在日志里就是不可见的 —— 见下方「半关闭」那条。
 * **空连接（连上就关）刻意不记日志。** k8s 的 `tcpSocket` 探针、端口扫描器、
   LB 健康检查都长这样，是公网端口上最频繁的事件。它们在库层被识别成
   `InboundOutcome::EmptyConnection`（**不是 `Err`**），CLI 对它静默。否则探针每
   10 秒一行错误日志，真故障会被淹掉。
+* **网络来源的字段会转义。** `sni` / `target` 是对端可控的字节；不转义的话，
+  攻击者只要在 SNI 里塞一个换行，就能在日志里凭空伪造出一条 `outcome=Forwarded`。
+  有单测钉住这一点。
+
+### 两个平台层面的坑（部署前必读）
+
+**1. wasmtime 会把 guest 的退出码塌缩成 1。**
+
+```
+guest exit(0)  -> rc=0
+guest exit(1)  -> rc=1
+guest exit(2)  -> rc=1     ← 拿不回来
+guest exit(42) -> rc=1
+```
+
+配置自检在代码里走的是 `std::process::exit(2)`（宿主二进制上实测就是 2），
+但**在 wasmtime 下只能观察到 0 / 非 0**。所以 k8s `initContainer`、CI 或任何
+脚本里**不要写 `== 2`** —— 那种检查在宿主上过、在 wasm 上必红。
+
+**2. 目标域名解析在 guest 里可能卡满 30 秒才失败。**
+
+解析走的是宿主的能力（wasmtime `-S allow-ip-name-lookup=y`），命中两种不同的失败：
+
+* `Permission denied` → 宿主没给这个能力，**加 flag**；
+* `Name does not resolve` / 超时 → 解析器没作答，**加 flag 无效**，要去查宿主/容器的 DNS。
+  本工程实测遇到过一次这样的瞬时故障：宿主 `nslookup` 毫秒级正常，guest 侧却每个请求
+  都卡满 30 秒后 `ResolveFailed`，几分钟后自行恢复。
+
+服务端会把这两种情况分别写成**不同的 `reason`**（有单测钉住），
+因为它们的排查方向是相反的。要彻底绕开解析，`XT_DEST` 与目标都可以用 IP 字面量
+（IP 不经过 DNS，也不阻塞事件循环）。
 
 ### 服务端的已知限制
 

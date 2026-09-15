@@ -118,13 +118,13 @@ mod platform;
 mod platform;
 
 pub use platform::{
-    block_on, connect, listen, sleep, spawn_task, timeout, yield_now, Elapsed, NetListener,
-    NetStream,
+    block_on, connect, listen, resolve, sleep, spawn_task, timeout, yield_now, Elapsed,
+    NetListener, NetStream,
 };
 
 mod relay;
 
-pub use relay::relay_bidirectional;
+pub use relay::{relay_bidirectional, RelayStats};
 
 #[cfg(test)]
 mod tests {

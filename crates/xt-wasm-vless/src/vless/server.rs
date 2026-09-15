@@ -174,19 +174,74 @@ pub struct InboundConfig {
     pub users: Vec<[u8; 16]>,
 }
 
-/// 一条连接最终走了哪条路。
+/// 一条连接最终**怎么了**。这是日志里 `outcome=` 字段的全部取值。
+///
+/// 刻意做成「分类」而不是「错误」：除了 `EmptyConnection`，其余每一个都是
+/// 服务端**正常处理完毕**的结果 —— 包括它决定拒绝、以及它连不上目标。
+/// 于是 `serve_inbound*` 的 `Err` 只剩一种含义：**服务端自己坏了**。
+/// 这个区分让调用方不必再从错误字符串里猜发生了什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundOutcome {
-    /// 授权用户，已转发到目标
-    Forwarded { target: String },
-    /// 未通过认证，已转发到 dest（探测者看到的是一次普通访问）
+    /// 授权用户，已转发到目标（字节数在 [`InboundReport`] 上）。
+    Forwarded,
+    /// 未通过 REALITY 认证，已原样转发到 `dest`（探测者看到的是一次普通访问）。
     FellBack,
+    /// 请求没被接受：用户不在名单里 / 不是 TCP / 声明了服务端还不支持的 flow。
+    ///
+    /// `reason` 是**给运维看的**，必须写清「客户端要怎么改」，不能只说「不支持」。
+    Rejected { reason: String },
+    /// 目标域名解析失败（DNS 问题，与「端口没人听」是两回事）。
+    ResolveFailed { reason: String },
+    /// 解析到了地址但连不上（端口没开、被防火墙挡、目标拒绝）。
+    ConnectFailed { reason: String },
     /// 对端连上后一个字节没发就关了。
     ///
     /// 这**不是失败**：k8s 的 `tcpSocket` 探针、端口扫描器、LB 健康检查
     /// 都长这样，而且是公网端口上最频繁的事件。单独成一类，
     /// 调用方才能对它静音，不至于让探针淹没真正的错误。
     EmptyConnection,
+}
+
+/// 一条连接的**完整结局**：分类 + 足以写出一行可排障日志的全部上下文。
+///
+/// 为什么把上下文和分类分开而不是塞进枚举变体：这十几个字段里有几个是
+/// 「有没有走到那一步才知道」（比如 `short_id` 要握手成功、`target` 要 VLESS 解出来），
+/// 塞进变体会让每个变体都长出一堆 `Option`，匹配起来反而更乱。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundReport {
+    pub outcome: InboundOutcome,
+    /// ClientHello 里的 SNI。握手成功就有。
+    pub server_name: Option<String>,
+    /// 客户端上报的 REALITY ClientVer。握手成功就有。
+    pub client_version: Option<[u8; 3]>,
+    /// 客户端上报的 shortId。握手成功就有。
+    pub short_id: Option<[u8; 8]>,
+    /// VLESS 请求里的目标 `host:port`。解出请求头才有。
+    pub target: Option<String>,
+    /// 客户端 → 目标 的字节数。
+    pub up_bytes: u64,
+    /// 目标 → 客户端 的字节数。
+    pub down_bytes: u64,
+}
+
+impl InboundReport {
+    /// 只带一个分类的最小报告。
+    fn bare(outcome: InboundOutcome) -> Self {
+        Self {
+            outcome,
+            server_name: None,
+            client_version: None,
+            short_id: None,
+            target: None,
+            up_bytes: 0,
+            down_bytes: 0,
+        }
+    }
+
+    /// 这条连接是不是「连上就关」的空连接（调用方通常要对它静音）。
+    pub fn is_empty_connection(&self) -> bool {
+        matches!(self.outcome, InboundOutcome::EmptyConnection)
+    }
 }
 
 /// 连接**刚做出判定**时发出的事件，早于任何字节被转发。
@@ -196,11 +251,22 @@ pub enum InboundOutcome {
 /// 测试里也只能靠 sleep 猜时机。服务端必须能在连接**建立的当下**说话。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
-    /// REALITY 认证通过、VLESS 请求头解析完成，即将连接 `target`。
+    /// REALITY 认证通过、VLESS 请求头解析完成。
     ///
-    /// 注意措辞是「即将连接」：`target` 能否连通还不一定，
-    /// 连不上会在随后以一个 `Err` 结束。
-    Authenticated { user: [u8; 16], target: String },
+    /// **此时还没有判定 user / cmd / flow 是否被接受** —— 那三件事的结果在
+    /// [`InboundOutcome`] 里（`Forwarded` 还是 `Rejected`）。这里给的是身份，
+    /// 它的用途是「这条连接是谁发来的」：多客户端/多配置时，
+    /// 一个 `short_id` 就能定位到是哪一份配置出了问题。
+    Authenticated {
+        user: [u8; 16],
+        target: String,
+        /// 客户端上报的 REALITY ClientVer。
+        client_version: [u8; 3],
+        /// 客户端上报的 shortId。
+        short_id: [u8; 8],
+        /// ClientHello 里的 SNI（客户端没发就是 `None`）。
+        server_name: Option<String>,
+    },
     /// 未通过 REALITY 认证，按陌生流量原样转发到 `dest`。
     Fallback { server_name: Option<String> },
 }
@@ -220,47 +286,127 @@ fn addr_to_target(addr: &VlessAddr, port: u16) -> String {
 
 /// 处理一条入站连接直到转发结束。
 ///
-/// 想在连接**建立时**就记一笔日志/指标，用 [`serve_inbound_with_events`]。
-pub async fn serve_inbound(stream: Box<dyn Stream>, cfg: &InboundConfig) -> Result<InboundOutcome> {
+/// 返回值里的 [`InboundReport`] 带着这条连接的**完整结局**（分类 + SNI + 身份 +
+/// 目标 + 字节数），足以写出一行可排障的日志。
+///
+/// 想在连接**建立时**就收到通知（而不是等它结束），用
+/// [`serve_inbound_with_events`]。
+///
+/// # `Ok` / `Err` 的分工
+///
+/// `Ok` 表示服务端**正常处理完了**这条连接 —— 包括它决定拒绝、以及它连不上目标。
+/// `Err` 只剩「服务端自己出了问题」（握手内部错误、转发中途 IO 失败等）。
+/// 这样调用方不必再从错误字符串里猜发生了什么。
+pub async fn serve_inbound(stream: Box<dyn Stream>, cfg: &InboundConfig) -> Result<InboundReport> {
     serve_inbound_with_events(stream, cfg, |_| {}).await
 }
 
-/// 同 [`serve_inbound`]，但在做出判定的当下回调 `on_event`。
+/// 同 [`serve_inbound`]，但在**拿到身份的当下**回调 `on_event`。
 ///
-/// 回调在**转发任何字节之前**被调用，所以：
-/// * 它可以安全地打日志 —— 此时连接已经确定归属，但还没开始搬数据；
+/// 回调时机早于任何字节被转发，所以：
+/// * 它可以安全地打日志/记指标；
 /// * 它不能阻塞（整个 future 是单线程跑的），别在里面做 IO。
 pub async fn serve_inbound_with_events<F>(
     stream: Box<dyn Stream>,
     cfg: &InboundConfig,
     mut on_event: F,
-) -> Result<InboundOutcome>
+) -> Result<InboundReport>
 where
     F: FnMut(InboundEvent),
 {
+    // ── 1) REALITY 握手 ──
     let handshake = match reality_server_handshake(stream, &cfg.reality).await {
         Ok(h) => h,
         // 空连接在这里就终结：不当作错误往上抛。
         // 抛成 Err 的话，每个调用方都得去字符串匹配「是不是那个 EOF」才能静音，
         // 而总有人会忘 —— 于是 k8s 探针每 10 秒刷一条错误日志。
         Err(TransportError::EmptyConnection) => {
-            return Ok(InboundOutcome::EmptyConnection);
+            return Ok(InboundReport::bare(InboundOutcome::EmptyConnection));
         }
         Err(e) => return Err(to_meow(e)),
     };
 
     match handshake {
-        HandshakeOutcome::Authenticated { mut stream, .. } => {
-            let req = decode_request(&mut stream).await?;
+        // ── 2) 授权路径 ──
+        HandshakeOutcome::Authenticated {
+            mut stream,
+            auth,
+            server_name,
+        } => {
+            let base = InboundReport {
+                outcome: InboundOutcome::Rejected {
+                    reason: String::new(),
+                },
+                server_name: server_name.clone(),
+                client_version: Some(auth.client_version),
+                short_id: Some(auth.short_id),
+                target: None,
+                up_bytes: 0,
+                down_bytes: 0,
+            };
+
+            // VLESS 请求头解不出来：可能是客户端根本不是 VLESS，或版本对不上。
+            // 注意这**不能**回退到 dest —— 此时我们已经用一个真证书完成了握手，
+            // 半路改道只会让对端看到更奇怪的东西。明确拒绝并记下原因。
+            let req = match decode_request(&mut stream).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(InboundReport {
+                        outcome: InboundOutcome::Rejected {
+                            reason: format!(
+                                "VLESS 请求头解析失败：{e}；\
+                                 请确认客户端是 VLESS（而不是 VMess/Trojan），\
+                                 且与服务端版本兼容"
+                            ),
+                        },
+                        ..base
+                    });
+                }
+            };
+
+            let target = addr_to_target(&req.addr, req.port);
+
+            // 身份在这一刻就齐了。**早于** user/cmd/flow 的判定发出，
+            // 这样被拒绝的连接在日志里也能指名道姓（否则运维只能看到
+            // 一句「有个连接被拒了」，无从知道是哪台设备/哪份配置）。
+            on_event(InboundEvent::Authenticated {
+                user: req.user_id,
+                target: target.clone(),
+                client_version: auth.client_version,
+                short_id: auth.short_id,
+                server_name: server_name.clone(),
+            });
+
+            let base = InboundReport {
+                target: Some(target.clone()),
+                ..base
+            };
 
             // 认证只证明对方知道共享密钥，不代表这个 UUID 被允许
             if !cfg.users.iter().any(|u| u == &req.user_id) {
-                return Err(MeowError::ProxyAuthFailed);
+                return Ok(InboundReport {
+                    outcome: InboundOutcome::Rejected {
+                        reason: format!(
+                            "REALITY 认证已通过，但该 UUID 不在服务端 users 名单里（user={}）；\
+                             请把客户端的 id 改成 XT_USERS 里的某一个",
+                            format_uuid(&req.user_id)
+                        ),
+                    },
+                    ..base
+                });
             }
+
             if !req.is_tcp() {
-                return Err(MeowError::NotSupported(
-                    "服务端目前只实现了 VLESS TCP".into(),
-                ));
+                return Ok(InboundReport {
+                    outcome: InboundOutcome::Rejected {
+                        reason: format!(
+                            "服务端目前只实现了 VLESS TCP（收到 cmd={:?}，即 UDP）；\
+                             请在客户端关闭 UDP/QUIC 与 mux（udp:false / mux:false）后重试",
+                            req.command
+                        ),
+                    },
+                    ..base
+                });
             }
 
             // 客户端请求了 Vision 流控，但服务端侧还没实现。
@@ -269,22 +415,50 @@ where
             // 属于最难排查的那类故障。
             if let Some(flow) = req.flow.as_deref() {
                 if !flow.is_empty() {
-                    return Err(MeowError::NotSupported(format!(
-                        "服务端尚未实现 Vision 流控（客户端请求了 flow={flow}）；\
-                         请把客户端 flow 置空，或等待服务端支持"
-                    )));
+                    return Ok(InboundReport {
+                        outcome: InboundOutcome::Rejected {
+                            reason: format!(
+                                "服务端尚未实现 Vision 流控（客户端请求了 flow={flow}）；\
+                                 请在客户端把 flow 置空（官方 Xray 写 flow:\"\"），\
+                                 或改用本工程客户端并加 --no-flow"
+                            ),
+                        },
+                        ..base
+                    });
                 }
             }
 
-            let target = addr_to_target(&req.addr, req.port);
-            on_event(InboundEvent::Authenticated {
-                user: req.user_id,
-                target: target.clone(),
-            });
+            // ── 解析与连接分开 ──
+            // 这两步的排查方向完全不同：解析失败是 DNS/域名问题，
+            // 连不上是「端口没人听 / 被防火墙挡」。混成一句 connect failed
+            // 等于把排障成本推给运维。
+            let addrs = match xt_wasm_runtime::resolve(&target) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Ok(InboundReport {
+                        outcome: InboundOutcome::ResolveFailed {
+                            reason: resolve_hint("目标", &target, &e),
+                        },
+                        ..base
+                    });
+                }
+            };
 
-            let outbound = connect(&target)
-                .await
-                .map_err(|e| MeowError::Proxy(format!("连接目标 {target} 失败：{e}")))?;
+            let outbound = match connect(&target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return Ok(InboundReport {
+                        outcome: InboundOutcome::ConnectFailed {
+                            reason: format!(
+                                "连接目标 {target}（解析为 {addrs:?}）失败：{e}；\
+                                 若为 remote-unreachable，先确认该端口确实有服务在监听，\
+                                 且本服务端的 egress 未被 NetworkPolicy 挡住"
+                            ),
+                        },
+                        ..base
+                    });
+                }
+            };
 
             // **必须回一条 VLESS 响应头**：`[version=0][addon_len=0]`。
             // 客户端连接建立后会先读这两个字节再读负载；不发的话它会把负载的
@@ -294,30 +468,127 @@ where
             stream.write_all(&[0x00, 0x00]).await?;
             stream.flush().await?;
 
-            relay_bidirectional(Box::new(stream), Box::new(outbound)).await?;
-            Ok(InboundOutcome::Forwarded { target })
+            let stats = relay_bidirectional(Box::new(stream), Box::new(outbound)).await?;
+            Ok(InboundReport {
+                outcome: InboundOutcome::Forwarded,
+                up_bytes: stats.up,
+                down_bytes: stats.down,
+                ..base
+            })
         }
 
+        // ── 3) 回退路径（抗主动探测）──
         HandshakeOutcome::Fallback {
             stream,
             buffered,
             server_name,
         } => {
-            on_event(InboundEvent::Fallback { server_name });
+            on_event(InboundEvent::Fallback {
+                server_name: server_name.clone(),
+            });
 
-            let mut outbound = connect(&cfg.dest)
-                .await
-                .map_err(|e| MeowError::Proxy(format!("连接 dest {} 失败：{e}", cfg.dest)))?;
+            let base = InboundReport {
+                outcome: InboundOutcome::FellBack,
+                server_name,
+                client_version: None,
+                short_id: None,
+                target: Some(cfg.dest.clone()),
+                up_bytes: 0,
+                down_bytes: 0,
+            };
+
+            let addrs = match xt_wasm_runtime::resolve(&cfg.dest) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Ok(InboundReport {
+                        outcome: InboundOutcome::ResolveFailed {
+                            reason: resolve_hint("dest", &cfg.dest, &e),
+                        },
+                        ..base
+                    });
+                }
+            };
+
+            let mut outbound = match connect(&cfg.dest).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return Ok(InboundReport {
+                        outcome: InboundOutcome::ConnectFailed {
+                            reason: format!(
+                                "连接 dest {}（解析为 {addrs:?}）失败：{e}；\
+                                 dest 不可达时抗主动探测会**失效**（探测者拿不到真实站点），\
+                                 请优先修好它",
+                                cfg.dest
+                            ),
+                        },
+                        ..base
+                    });
+                }
+            };
 
             // **先把已经读走的字节补发给 dest**。认证流程要读 ClientHello 才能判断，
             // 那一段已经被我们消费了；不补发的话 dest 看到的是半截握手，会直接断开。
             outbound.write_all(&buffered).await?;
             outbound.flush().await?;
 
-            relay_bidirectional(stream, Box::new(outbound)).await?;
-            Ok(InboundOutcome::FellBack)
+            let stats = relay_bidirectional(stream, Box::new(outbound)).await?;
+            Ok(InboundReport {
+                up_bytes: stats.up,
+                down_bytes: stats.down,
+                ..base
+            })
         }
     }
+}
+
+/// 给解析失败配一句**能直接照着做**的提示。
+///
+/// # 为什么不能只写一句「解析失败」
+///
+/// 实测过两种完全不同的解析失败，排查方向相反：
+///
+/// * `Permission denied` —— 宿主没给 `ip-name-lookup` 能力（wasmtime 漏了
+///   `-S allow-ip-name-lookup=y`）。**改配置**就好。
+/// * `Name does not resolve` / 超时 —— 解析器本身没能作答。**改配置没用**，
+///   要去查宿主（或容器）的 DNS。实测在 wasmtime 上这类失败会**卡满 30 秒**
+///   才返回，于是现象是「每个请求都慢 30 秒然后失败」，很容易被误判成
+///   「隧道不通」。
+///
+/// 把这两种混成一句话，就等于把排查成本又推回给运维 —— 而这正是本次改动
+/// 要消灭的东西。
+fn resolve_hint(what: &str, host: &str, e: &std::io::Error) -> String {
+    let raw = e.to_string();
+    let denied = raw.contains("Permission denied")
+        || raw.contains("permission denied")
+        || e.kind() == std::io::ErrorKind::PermissionDenied;
+    if denied {
+        format!(
+            "解析{what} {host} 失败：{raw}；\
+             这是**宿主缺少 ip-name-lookup 能力**，不是网络问题 —— \
+             请在 wasmtime 参数里加上 -S allow-ip-name-lookup=y \
+             （k8s 下检查运行时清单是否透传了该 flag）"
+        )
+    } else {
+        format!(
+            "解析{what} {host} 失败：{raw}；\
+             解析器没能作答（不是权限问题，加 -S allow-ip-name-lookup=y 无效）。\
+             若耗时接近 30 秒，说明是 DNS 超时：请检查宿主/容器的 DNS 配置，\
+             或把 {host} 换成 IP 字面量以绕开解析（IP 不经过 DNS，也不阻塞事件循环）"
+        )
+    }
+}
+
+/// 把 UUID 渲染回 `8-4-4-4-12` 的规范形式，供拒绝原因里点名用。
+fn format_uuid(b: &[u8; 16]) -> String {
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 #[cfg(test)]
@@ -414,8 +685,8 @@ mod tests {
         );
         assert!(
             matches!(
-                outcome.expect("入站不应报错"),
-                InboundOutcome::Forwarded { .. }
+                outcome.expect("入站不应报错").outcome,
+                InboundOutcome::Forwarded
             ),
             "授权客户端应当走转发路径"
         );
@@ -510,6 +781,9 @@ mod tests {
                     vec![InboundEvent::Authenticated {
                         user: uuid,
                         target: format!("127.0.0.1:{echo_port}"),
+                        client_version: [26, 3, 27],
+                        short_id: SHORT_ID,
+                        server_name: Some(SNI.to_string()),
                     }],
                 );
 
@@ -519,8 +793,8 @@ mod tests {
             };
             let (outcome, ()) = futures::join!(server, client);
             assert!(matches!(
-                outcome.expect("入站不应报错"),
-                InboundOutcome::Forwarded { .. }
+                outcome.expect("入站不应报错").outcome,
+                InboundOutcome::Forwarded
             ));
         });
     }
@@ -578,7 +852,7 @@ mod tests {
             let (outcome, ()) = futures::join!(server, client);
             assert!(
                 matches!(
-                    outcome.expect("回退路径本身不应报错"),
+                    outcome.expect("回退路径本身不应报错").outcome,
                     InboundOutcome::FellBack
                 ),
                 "认证失败必须走 FellBack"
@@ -633,13 +907,40 @@ mod tests {
         });
 
         assert_eq!(
-            outcome.expect("空连接不该是 Err"),
+            outcome.expect("空连接不该是 Err").outcome,
             InboundOutcome::EmptyConnection
         );
         assert!(
             events.borrow().is_empty(),
             "空连接不该产生认证/回退事件（那两行日志表示真的有人在用）"
         );
+    }
+
+    /// 解析失败的提示必须**区分**两种成因，且各自给出可执行动作。
+    ///
+    /// 这两类失败排查方向相反（改 wasmtime flag vs 查 DNS），
+    /// 混成一句就等于把成本推回给运维 —— 而本次改动就是要消灭这种事。
+    #[test]
+    fn resolve_failure_hint_distinguishes_the_two_real_causes() {
+        use std::io::{Error, ErrorKind};
+
+        // ① 缺 ip-name-lookup 能力：提示指向 wasmtime flag
+        let denied = Error::new(ErrorKind::PermissionDenied, "Permission denied");
+        let h = resolve_hint("目标", "example.com:443", &denied);
+        assert!(h.contains("allow-ip-name-lookup=y"), "{h}");
+        assert!(h.contains("不是网络问题"), "要明确排除网络方向：{h}");
+
+        // ② 解析器没作答（实测到的 30 秒超时就是这一类）：
+        //    必须明确说「加 flag 无效」，否则运维会照着上一条去改一个无关的开关
+        let nores = Error::other("failed to lookup address information: Name does not resolve");
+        let h = resolve_hint("目标", "example.com:443", &nores);
+        assert!(h.contains("不是权限问题"), "{h}");
+        assert!(
+            h.contains("加 -S allow-ip-name-lookup=y 无效"),
+            "必须明确劝阻那个无效动作：{h}"
+        );
+        assert!(h.contains("30 秒"), "要点出超时这个特征：{h}");
+        assert!(h.contains("IP 字面量"), "要给出可执行的绕开办法：{h}");
     }
 
     /// 未授权的 UUID 必须被拒（认证过了不等于这个用户被允许）。
@@ -697,11 +998,22 @@ mod tests {
             })
         });
 
-        let err = outcome.expect_err("未授权 UUID 必须被拒");
+        // REALITY 认证过了但 UUID 不在名单里 —— 这是 `Rejected`（服务端正常判定
+        // 的结果），**不是** `Err`（那表示服务端自己坏了）。见 `InboundOutcome` 的说明。
+        let report = outcome.expect("未授权 UUID 应当被正常判定为 Rejected，而不是 Err");
+        let InboundOutcome::Rejected { reason } = &report.outcome else {
+            panic!("未授权 UUID 必须被拒，实际 {:?}", report.outcome);
+        };
+        // 拒绝原因必须**可执行**：点名是哪个 UUID，并说清客户端要怎么改。
+        assert!(reason.contains("不在服务端 users 名单里"), "{reason}");
         assert!(
-            matches!(err, MeowError::ProxyAuthFailed),
-            "应当是认证失败，实际 {err:?}"
+            reason.contains("11111111-1111-1111-1111-111111111111"),
+            "拒绝原因应当点名出问题的 UUID（多设备/多配置时才知道是哪一份）：{reason}"
         );
+        assert!(reason.contains("XT_USERS"), "要给修复建议：{reason}");
+        // 身份必须被带出来，否则日志里这条拒绝记录无从定位
+        assert_eq!(report.short_id, Some([1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(report.client_version, Some([26, 3, 27]));
     }
 
     /// 请求了 Vision 流控时必须明确报错，而不是把填充帧当成原始数据发出去。
@@ -757,10 +1069,18 @@ mod tests {
             })
         });
 
-        let err = outcome.expect_err("请求 Vision 时必须明确报错");
+        let report = outcome.expect("请求 Vision 应当被正常判定为 Rejected，而不是 Err");
+        let InboundOutcome::Rejected { reason } = &report.outcome else {
+            panic!("请求 Vision 必须被拒，实际 {:?}", report.outcome);
+        };
         assert!(
-            err.to_string().contains("Vision"),
-            "错误信息应当点明 Vision，实际：{err}"
+            reason.contains("Vision"),
+            "要点明是 Vision 的问题：{reason}"
+        );
+        // 关键：**必须给出客户端怎么改**，不能只说「不支持」。
+        assert!(
+            reason.contains("flow") && reason.contains("--no-flow"),
+            "拒绝原因应当告诉客户端怎么改（置空 flow / 用 --no-flow）：{reason}"
         );
     }
 
@@ -846,7 +1166,10 @@ mod tests {
         });
 
         assert!(
-            matches!(outcome.expect("回退本身不应报错"), InboundOutcome::FellBack),
+            matches!(
+                outcome.expect("回退本身不应报错").outcome,
+                InboundOutcome::FellBack
+            ),
             "未授权客户端应当走回退路径"
         );
 

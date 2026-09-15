@@ -979,3 +979,135 @@ for _, shortId := range c.ShortIds {
 
 这是刻意的取舍（全零 shortId 意味着任何知道公钥的人都能通过 REALITY 认证），
 但它是**与 stock Xray 的功能差异**，此前没写下来，现在写了。
+
+---
+
+## V23 · 自环互通（wasm↔wasm）+ 可诊断性 —— 途中挖出一个连接泄漏
+
+工单要求五件事：客户端 `--no-flow`、解析/连接失败可分辨、非 TCP 拒绝可执行、
+服务端一行日志、`--check` 自检。做第 4 条（一行日志）时**挖出一个真 bug**，
+而且正是它让第 4 条一开始根本不工作。
+
+### 先说 bug：半关闭是个空实现，每条连接都泄漏
+
+`InboundOutcome` 原本只在连接**结束**时返回。把日志改成「结束时写一行」之后，
+日志一行都不出。查下去发现中继**永远不返回**：
+
+```
+服务端 socket：127.0.0.1:9444->…  ESTABLISHED   ← 客户端侧一直不关
+             198.18.0.1:…->104.20.23.154:443  CLOSE_WAIT  ← 目标已发 FIN，我们没关
+```
+
+根因在 `crates/xt-wasm-runtime/src/wasi.rs`：
+
+```rust
+fn shutdown_write(&self) -> io::Result<()> {
+    Ok(())          // ← 空实现
+}
+```
+
+`relay_bidirectional` 的收尾完全依赖它：某个方向读到 EOF 后 `shutdown` 对端写方向，
+让对端知道「我说完了」。空实现 ⇒ FIN 永远发不出去 ⇒ 对端读不到 EOF ⇒
+另一个方向永远挂着 ⇒ 中继不返回。
+
+后果比「日志不出现」严重得多：
+
+* 每条连接在服务端留下一个不回收的 socket（目标侧 `CLOSE_WAIT` + 客户端侧 `ESTABLISHED`），
+  **请求照样 200，所以没人会发现** —— 长跑就是 fd 泄漏；
+* 此前所有 e2e 都测不出它，因为它们断言的是「判定发生时」的那行日志。
+  改成「结束时」才写，它立刻现形。
+
+修法是用 WASI 的底层调用（`OutputStream` 没有 shutdown）：
+
+```rust
+self.socket.shutdown(ShutdownType::Send).map_err(wasi_err)
+```
+
+修复后实测：**3 次请求 → 3 行 `outcome=Forwarded`，残留连接 0**（修复前是 3+3）。
+`scripts/e2e-wasm-to-wasm-test.sh` 里加了回归守卫：
+「N 次请求必须写出 N 行结局」，半关闭一旦退化就会红。
+
+> 教训：**「连接结束时写日志」这个改动本身就是个探针。**
+> 原先「判定时就写」的设计让一个连接泄漏 bug 藏了很久 —— 日志写得越早，
+> 越掩盖「收尾有没有走完」这件事。
+
+### 一行日志（工单第 4 条）
+
+```
+[server] ts=2026-09-15T11:41:12Z dir=in src=127.0.0.1:50388 sni=www.cloudflare.com \
+         ver=26.3.27 sid=2c3d58a3c703d187 target=example.com:443 outcome=Forwarded \
+         dur_ms=1320 up_bytes=585 down_bytes=4867
+```
+
+`outcome ∈ {Forwarded, FellBack, Rejected, ResolveFailed, ConnectFailed}`，
+外加 `Error`（服务端自身出错）。前五个都是 **`Ok`**：服务端正常处理完了这条连接，
+包括它决定拒绝或连不上目标；`Err` 只剩「服务端坏了」一种含义。
+
+两处刻意的设计：
+
+* **`Rejected` / `ResolveFailed` / `ConnectFailed` 从 `Err` 改成 `Ok`。**
+  否则调用方只能靠字符串匹配去猜发生了什么 —— 而 V21 已经为「空连接」踩过一次
+  同样的坑。`InboundReport` 承载上下文（sni/ver/sid/target/字节数），`InboundOutcome`
+  只承载分类。
+* **网络来源字段一律转义。** `sni`/`target` 是对端可控的字节；不转义的话，
+  在 SNI 里塞一个换行就能在日志里伪造出一条 `outcome=Forwarded`。
+  单测 `hostile_sni_cannot_inject_a_log_line` 钉住。
+
+### 解析与连接分开（工单第 2 条）—— 上线当天就派上用场
+
+拆成 `resolve()` / `connect()` 之后，实测立刻抓到一次失败：
+
+```
+outcome=ResolveFailed reason="解析目标 example.com:443 失败：
+  failed to lookup address information: Name does not resolve…" dur_ms=30012
+```
+
+30 秒整。而**宿主上 `nslookup example.com` 是 59ms，guest 里用最小探针
+（`wasm32-wasip2` 直接 `to_socket_addrs`）也是 4ms**。所以这是一次**瞬时的解析器故障**：
+几分钟后自行恢复，同样的命令全部通过。
+
+它同时暴露了我第一版提示文案的错误：我写的是「若 wasmtime 报 PermissionDenied，
+检查是否漏了 `-S allow-ip-name-lookup=y`」—— 而这次根本不是权限问题，
+那个 flag 本来就传了。**照着那句话去改，只会去动一个无关的开关。**
+现在按错误类型分成两句不同的话（单测
+`resolve_failure_hint_distinguishes_the_two_real_causes` 钉住）：
+
+| 现象 | 含义 | 该做什么 |
+|---|---|---|
+| `Permission denied` | 宿主没给 `ip-name-lookup` 能力 | 加 `-S allow-ip-name-lookup=y` |
+| `Name does not resolve` / 卡满 30 秒 | 解析器没作答 | **加 flag 无效**；查宿主/容器 DNS，或改用 IP 字面量 |
+
+### 两个平台层面的坑（已写进 README）
+
+**1. wasmtime 把 guest 退出码塌缩成 1。** 实测：
+
+```
+guest exit(0) -> 0    guest exit(1) -> 1
+guest exit(2) -> 1    guest exit(42) -> 1
+```
+
+工单要求 `--check` 用「0 通过 / 2 失败」便于 k8s 断言。代码里仍然是
+`exit(2)`（宿主二进制上实测就是 2），但**在 wasmtime 下只能观察到 0 / 非 0**。
+e2e 因此断言「非 0」而不是「恰好 2」，并在注释里写明原因 ——
+写成 `== 2` 的检查会在宿主上过、在 CI/容器里必红。
+
+**2. `--no-flow` 必须同时关掉 flow 声明和客户端侧 Vision 分帧。**
+
+只把请求头里的 flow 置空、却仍然包 `VisionConn`，会把 Vision 的**填充帧**
+当成普通数据发给一个不做拆帧的服务端 —— 症状是「连上了但数据是坏的」，
+属于最难查的那类故障。所以 `open_tunnel` 里这两件事由同一个 `no_flow` 决定。
+
+单测 `no_flow_changes_what_the_server_actually_reads` 走**真 socket + 真 REALITY 握手**，
+断言的是**服务端实际读到的字节**（用服务端给出的 outcome 反推）：
+默认 → `Rejected{…Vision…}`；`--no-flow` → 放行到连目标那一步。
+只测内部布尔量的写法抓不住「只关一半」。
+
+### 结果
+
+| 项目 | 结果 |
+|---|---|
+| 单测 | 100 → **109**（cli 24 / runtime 8 / tls 37 / vless 40） |
+| `./scripts/check.sh` | 9 项全绿 |
+| `./scripts/e2e-test.sh` | wasm 客户端 → stock 服务端 ✅ |
+| `./scripts/e2e-server-test.sh` | stock 客户端 → wasm 服务端 ✅ |
+| `./scripts/e2e-wasm-to-wasm-test.sh` | wasm `--no-flow` → wasm 服务端 ✅（新增，含半关闭回归守卫） |

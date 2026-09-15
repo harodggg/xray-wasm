@@ -19,12 +19,29 @@ use std::io;
 use crate::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+/// 一次转发的字节统计。
+///
+/// 方向以**调用方**为基准：`a` 是调用方这一侧的流，`b` 是对端。
+/// 所以 `up` = a→b，`down` = b→a。服务端调用时 a 是客户端连接、b 是目标站，
+/// 于是 `up` = 客户端上传、`down` = 目标回传。
+///
+/// 为什么要把它返回出来：服务端的一条日志要能回答「这次请求到底搬了多少字节」。
+/// 只报一个 `Forwarded` 而不带字节数，运维无法区分「隧道通了但目标没回内容」
+/// 和「压根没转发」—— 这恰恰是最需要日志来分辨的两种情形。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayStats {
+    /// a → b 的字节数。
+    pub up: u64,
+    /// b → a 的字节数。
+    pub down: u64,
+}
+
 /// 在两个流之间双向搬运，直到**两个方向都结束**。
 ///
 /// 半关闭语义：某个方向读到 EOF 时，立刻 `shutdown` 对端的写方向，
 /// 但**不**终止另一个方向 —— 对端可能还有数据要回（HTTP 的
 /// 「客户端先关、服务器再答」就依赖这一点）。
-pub async fn relay_bidirectional(a: Box<dyn Stream>, b: Box<dyn Stream>) -> io::Result<()> {
+pub async fn relay_bidirectional(a: Box<dyn Stream>, b: Box<dyn Stream>) -> io::Result<RelayStats> {
     let (a_read, a_write) = tokio::io::split(a);
     let (b_read, b_write) = tokio::io::split(b);
 
@@ -34,9 +51,39 @@ pub async fn relay_bidirectional(a: Box<dyn Stream>, b: Box<dyn Stream>) -> io::
     // 并发跑两个方向。任一方向出错不影响另一个继续收尾，
     // 所以这里先收齐两个结果再决定是否报错。
     let (r1, r2) = futures::join!(a_to_b, b_to_a);
-    r1?;
-    r2?;
-    Ok(())
+    let stats = RelayStats {
+        up: r1.as_ref().copied().unwrap_or(0),
+        down: r2.as_ref().copied().unwrap_or(0),
+    };
+    // 报错时也把**已经搬完的字节数**带上：半途断掉的连接恰恰是排障重点，
+    // 「转发到一半断了、断之前搬了多少」比一句 `ConnectionReset` 有用得多。
+    match (r1, r2) {
+        (Ok(_), Ok(_)) => Ok(stats),
+        (Err(e), _) | (_, Err(e)) => Err(io::Error::new(e.kind(), RelayError { source: e, stats })),
+    }
+}
+
+/// 把字节统计挂在 `io::Error` 上一起往上带。
+#[derive(Debug)]
+struct RelayError {
+    source: io::Error,
+    stats: RelayStats,
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}（断之前 up={} 字节 down={} 字节）",
+            self.source, self.stats.up, self.stats.down
+        )
+    }
+}
+
+impl std::error::Error for RelayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// 单向搬运，读到 EOF 后把 EOF 传播给对端。

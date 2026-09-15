@@ -1748,3 +1748,54 @@ wasmtime run -C cache=n -S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y 
    （这在只读探针里不发生，说明与"写过"有关的状态参与了唤醒）。
 
 **这个 bug 至今未修复。** 上面每条结论都来自实测，没有推测。
+
+### V24 十四续：**发现我自己一个重大验证漏洞 —— 「不是 wstd」这个结论没在写路径上验证过**
+
+两件事：
+
+**1. wstd 的写逻辑与我们逐行相同**（`wstd-0.6.8/src/io/streams.rs`）：
+
+```rust
+match self.stream.check_write() {
+    Ok(0) => { self.ready().await; continue; }   // 与我们完全一样的门控
+    Ok(some) => { let writable = some.min(buf.len()); self.stream.write(&buf[..writable]) }
+    ...
+}
+```
+
+⇒ **`check_write()` 的门控方式不是 bug**，那是一条死路（这也是我上一轮"绕过 check_write"
+失败的根本原因）。
+
+**2. 但我的「不是 wstd / wasmtime」结论有一个致命漏洞：**
+
+我那两个纯 wstd 最小复现器（`minrepro` #1 和 #3）**只做了 `read` 和 `connect`，
+从来没有写过任何数据**。而 V24 十一续已经实测出：**触发条件是「写」**。
+
+> ⇒ **「不是 wstd/wasmtime」这个结论，我根本没有在写路径上验证过。**
+
+而 V24 六续那个「纯 wstd = 0 ticks」的对照，当时**看起来**是决定性的，
+现在看它的覆盖面比我以为的窄得多 —— 它只证明了「wstd 在只读/只连的情况下不自旋」，
+那是个**从来不会自旋**的场景。
+
+**这是我这几轮里第二次因为「对照组选得不对」而得出过宽结论**（第一次是
+「只读探针 0 ticks ⇒ socket 层没问题」，同样漏掉了写路径）。
+
+## 修正后的结论
+
+| 结论 | 状态 |
+|---|---|
+| 不是 `wstd`/`wasmtime` | ⚠️ **未经写路径验证，撤回** |
+| socket 层写法有问题 | ⚠️ 同样只在只读下验证过，**存疑** |
+| 触发条件是「写过」（我们的 NetStream） | ✅ 实测 |
+| `check_write()` 恒为 0 | ✅ 实测 |
+| wstd 的写逻辑与我们相同 | ✅ 源码比对 |
+
+## 下一步（**唯一该做的**）
+
+写一个**纯 wstd 的写探针**：`wstd::net::TcpListener` accept → 每个连接
+`stream.write_all(...)`（或 `wstd::io::AsyncWrite::write`）→ 挂住，300 条连接。
+
+* 若它也自旋 ⇒ **根因在 wasmtime/wstd**，我们前面 6 个假设全部白费，方向要整个转过来；
+* 若不自旋 ⇒ 才对得上「不是 wstd」，那时才轮到在 `NetStream` 里继续找。
+
+**这个探针此前从未跑过，而它是最省事、最可能翻盘的一个。**

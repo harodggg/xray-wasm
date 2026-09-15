@@ -362,25 +362,92 @@ pub fn resolve(addr: &str) -> io::Result<Vec<std::net::SocketAddr>> {
     Ok(addr.to_socket_addrs()?.collect())
 }
 
+/// 单次 `connect` 的**总**时间预算。
+///
+/// # 为什么必须有这个
+///
+/// 一个域名常常解析出十几个地址（实测 `www.google.com` 是 8 个 IPv4 + 8 个 IPv6），
+/// 而它们是**顺序**试的、每个各自超时。目标端口若被丢包（而不是回 RST），
+/// 每个地址都要等满 TCP 超时 —— 实测一条请求 **1080 秒（18 分钟）** 才失败：
+///
+/// ```text
+/// dur_ms=1080453  target=www.google.com:5222  outcome=ConnectFailed
+/// ```
+///
+/// 18 分钟里它一直占着一个并发槽位（上限 256）。客户端并发一高，
+/// 槽位被这些「慢慢失败」的连接占满，accept 循环就不再收新连接 ——
+/// 对外表现就是「TCP 连不上、readiness 探针超时、Service 没有 endpoints」。
+///
+/// 所以这里给**整次 connect** 一个硬预算：宁可快速失败让客户端重试，
+/// 也不能让一条连接把整个服务端拖死。
+const CONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+
+/// 单个地址的预算。取总预算的零头，保证试完前几个地址后还能留时间给后面的。
+const CONNECT_PER_ADDR_BUDGET: Duration = Duration::from_secs(3);
+
 /// 建立连接。支持 IP 字面量与域名。
 ///
 /// 连接本身是**非阻塞**的：`start_connect` 立即返回，完成由 pollable 通知。
 /// 解析的部分见 [`resolve`]（那里的阻塞说明同样适用）。
+///
+/// 地址是顺序试的，但整体受 [`CONNECT_TOTAL_BUDGET`] 约束。
 pub async fn connect(addr: &str) -> io::Result<NetStream> {
     let resolved = resolve(addr)?;
-    let mut last_err = None;
-    for sa in resolved {
-        match connect_addr(sa).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(
+    if resolved.is_empty() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("无法解析出任何地址：{addr}"),
-        )
-    }))
+        ));
+    }
+
+    let started = std::time::Instant::now();
+    let mut last_err = None;
+    let mut tried = 0usize;
+
+    // IPv4 优先：容器里常常没有 IPv6 出口，先试 v6 只会白等一个超时。
+    let mut ordered: Vec<std::net::SocketAddr> = resolved.clone();
+    ordered.sort_by_key(|a| a.is_ipv6());
+
+    for sa in ordered {
+        let left = CONNECT_TOTAL_BUDGET.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let budget = left.min(CONNECT_PER_ADDR_BUDGET);
+        tried += 1;
+        match timeout(budget, connect_addr(sa)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("连接 {sa} 超过 {} 秒未完成", budget.as_secs()),
+                ))
+            }
+        }
+    }
+
+    let elapsed = started.elapsed();
+    Err(match last_err {
+        Some(e) => io::Error::new(
+            e.kind(),
+            format!(
+                "{}（{addr} 共 {} 个地址，试了 {tried} 个，耗时 {:.1}s；\
+                 总预算 {}s）",
+                e,
+                resolved.len(),
+                elapsed.as_secs_f32(),
+                CONNECT_TOTAL_BUDGET.as_secs()
+            ),
+        ),
+        None => io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{addr} 在 {}s 预算内没试出可用地址",
+                CONNECT_TOTAL_BUDGET.as_secs()
+            ),
+        ),
+    })
 }
 
 /// 连到一个已解析的地址。

@@ -870,6 +870,33 @@ $ ./scripts/e2e-server-test.sh
   所以固化成规则：变量后跟非 ASCII 就必须写 `${VAR}`。
   实现时必须排除注释行 —— 解释这个坑本身就要在注释里写出反例
   （与 check 7 排除注释是同一个教训）。
+* **CI 抓到了本地一定看不到的可移植性问题**：抗探测那一步第一版去 grep
+  openssl 的人类可读输出（`a:PKEY: EC`），本地（macOS / LibreSSL）绿，
+  CI（Ubuntu / OpenSSL 3）直接红 —— 两边的排版不同：
+
+  ```
+  macOS：  s:CN=www.cloudflare.com      a:PKEY: EC, (prime256v1)
+  Ubuntu： s:CN = www.cloudflare.com    a:PKEY: id-ecPublicKey, 256 (bit)
+  ```
+
+  改成把证书取出来交给 `openssl x509 -nameopt RFC2253` / `openssl pkey -text`
+  做**结构化**判定。教训：断言不要去解析人类可读输出，哪怕它「看起来一样」。
+
+* **发版顺序：先发公告再验证是错的。** 原来的 `release.yml` 在 `wasm` job 里
+  建完 Release 才去建镜像 —— 镜像那一步失败时 Release 已经发出去了，而 README
+  和 k8s 清单都在让用户去拉那个镜像。改成三个 job 串起来：
+
+  ```
+  verify → wasm（只产出并上传产物）→ image（先本地 load 单架构冒烟，再多架构推送）
+                                      ↘ release（needs 两者，创建 Release）
+  ```
+
+  冒烟本身也值得存在：ENTRYPOINT 是 exec 形式且以 wasm 路径结尾，
+  `args: ["server"]` 能不能真的变成 guest 的 `argv[1]` 是**整条交付里最容易
+  静默出错的一环** —— 错了的话镜像「能构建、能启动」，但 k8s 里的服务端会
+  静默跑成客户端。现在三种调用方式（无参数 / `server` / `XT_MODE=server`）
+  在发版时各断言一次。
+
 * **e2e 里的公网抖动要显式重试而不是静默**：本机实测遇到过一次
   「服务端已记下认证通过，但 curl 侧没等到响应」。现在允许 3 次尝试，
   但**把重试次数打印出来** —— 悄悄重试会掩盖真实的间歇性故障，

@@ -11,6 +11,12 @@
 /.e2e-server.log
 /.e2e-client.log
 
+# gen-test-server.sh 生成的一次性测试服务端（含私钥，绝不入库）
+/.test-server/
+
+# build-image.sh 拷进构建上下文的 wasm 产物
+/xt-wasm-cli.wasm
+
 # 编辑器与系统
 .DS_Store
 *.swp

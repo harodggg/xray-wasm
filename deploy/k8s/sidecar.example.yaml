@@ -1,0 +1,75 @@
+# Sidecar 模式：代理与业务容器在同一个 Pod 里，业务只连 127.0.0.1。
+#
+# # 为什么推荐先从这个模式开始
+#
+# * 代理**不暴露**到 Pod 之外，没有开放代理风险；
+# * 不需要 Service、NetworkPolicy、也不依赖集群 CNI 是否支持网络策略；
+# * 因为只服务本 Pod，当前「一次只处理一条连接」的限制影响最小。
+#
+# 业务容器里设置：
+#     export https_proxy=socks5h://127.0.0.1:1080
+#     export http_proxy=socks5h://127.0.0.1:1080
+# 或直接
+#     curl --proxy socks5h://127.0.0.1:1080 https://example.com
+#
+# 注意 socks5h 的 h：让**服务端**去解析域名，而不是在 Pod 里解析 ——
+# 否则 DNS 泄漏且可能被本地 DNS 污染。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app-with-proxy
+  labels:
+    app.kubernetes.io/name: my-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: my-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: my-app
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # ── 业务容器 ──
+        - name: app
+          image: your-app:latest
+          env:
+            - name: https_proxy
+              value: socks5h://127.0.0.1:1080
+            - name: http_proxy
+              value: socks5h://127.0.0.1:1080
+            # 若业务本身在集群内也要互访，按需加 no_proxy
+            - name: no_proxy
+              value: localhost,127.0.0.1,.svc,.cluster.local
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+
+        # ── 代理 sidecar ──
+        - name: proxy
+          image: ghcr.io/harodggg/xray-wasm:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # 同一个 Pod 内通过回环访问，所以**保持默认的 127.0.0.1:1080**，
+          # 不对外暴露。此时即使不设认证也不会被别人用到。
+          # Secret 里的 XT_UUID/XT_PBK/XT_SID/XT_SNI/XT_SERVER 仍然必需。
+          envFrom:
+            - secretRef:
+                name: xray-wasm
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi

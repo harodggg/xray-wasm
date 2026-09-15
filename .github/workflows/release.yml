@@ -1,0 +1,218 @@
+name: Release
+
+# 打 tag 触发（例如 v0.1.0）。产出两样东西：
+#   1) GitHub Release 附件：wasm 模块 + 校验和（给直接下载 wasm 的人）
+#   2) 多架构容器镜像推到 GHCR（给 k8s 用）
+#
+# 关键设计：**镜像里的 wasm 与 Release 附件里的 wasm 是同一个文件**。
+# 工作流先编译一次，然后既作为附件上传、又 COPY 进镜像。
+# 若在镜像里重新编译，两者就可能不同步却都自称同一版本。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '手动发布时使用的 tag（例如 v0.1.0）'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  XW_CARGO_HOME: ${{ github.workspace }}/.cargo-home
+  XW_TARGET_DIR: ${{ github.workspace }}/target
+  WASMTIME_VERSION: v48.0.2
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 发布前必须先把 CI 的那套检查跑一遍 —— 不能从一个未验证的提交发版。
+  verify:
+    name: 发布前验证
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.XW_CARGO_HOME }}
+            ${{ env.XW_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --workspace
+
+  wasm:
+    name: 构建 wasm 包
+    runs-on: ubuntu-latest
+    needs: verify
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.XW_CARGO_HOME }}
+            ${{ env.XW_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 构建
+        run: cargo build -p xt-wasm-cli --release --target wasm32-wasip2
+
+      - name: 整理发布产物（含校验和）
+        id: hash
+        run: |
+          set -eux
+          mkdir -p dist
+          WASM="$XW_TARGET_DIR/wasm32-wasip2/release/xt-wasm-cli.wasm"
+          cp "$WASM" dist/xt-wasm-cli.wasm
+          # 校验和：让下载者能确认拿到的字节与 CI 构建的一致
+          ( cd dist && sha256sum xt-wasm-cli.wasm > xt-wasm-cli.wasm.sha256 )
+          cat dist/xt-wasm-cli.wasm.sha256
+          SIZE=$(stat -c%s dist/xt-wasm-cli.wasm)
+          echo "wasm 体积: $SIZE 字节"
+          echo "sha256=$(cut -d' ' -f1 dist/xt-wasm-cli.wasm.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: 上传产物（供 image job 使用，保证镜像与附件同源）
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dist
+          path: dist/
+          if-no-files-found: error
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## 产物
+
+            | 文件 | 说明 |
+            |---|---|
+            | `xt-wasm-cli.wasm` | wasm32-wasip2 模块（wasmtime 直接可跑） |
+            | `xt-wasm-cli.wasm.sha256` | 上述文件的 SHA-256 |
+
+            wasm 模块 SHA-256：`${{ steps.hash.outputs.sha256 }}`
+
+            ## 直接运行 wasm 模块
+
+            ```sh
+            wasmtime run -C cache=n \
+              -S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y -S inherit-env=y \
+              xt-wasm-cli.wasm \
+              --server <ip:port> --pbk <公钥> --sid <shortId> \
+              --sni <伪装域名> --uuid <uuid> --listen 127.0.0.1:1080
+            ```
+
+            > 四个 `-S` flag 缺一不可。尤其 `inherit-network=y` 缺失时报的是
+            > `PermissionDenied`，很容易被误读成「网络被墙」。
+            > `inherit-env=y` 是安全相关的：缺了它，凭据无法通过环境变量传入。
+
+            ## 容器镜像（k8s）
+
+            ```
+            ghcr.io/${{ github.repository }}:${{ github.event.inputs.tag || github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+            ```
+
+            部署清单与安全须知见仓库 `deploy/k8s/`。
+
+            ## 校验
+
+            ```sh
+            sha256sum -c xt-wasm-cli.wasm.sha256
+            ```
+          files: |
+            dist/xt-wasm-cli.wasm
+            dist/xt-wasm-cli.wasm.sha256
+
+  image:
+    name: 构建并推送容器镜像（k8s 用）
+    runs-on: ubuntu-latest
+    needs: wasm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取回同一个 wasm 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: dist
+
+      - name: 放进 Docker 构建上下文
+        run: cp dist/xt-wasm-cli.wasm ./xt-wasm-cli.wasm
+
+      - name: 设置 QEMU（arm64 交叉构建）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成标签与 OCI 元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # 发布即打 latest（tag 推送不属于默认分支，用 is_default_branch 不会生效）
+            type=raw,value=latest
+
+      - name: 构建并推送（amd64 + arm64）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            WASMTIME_VERSION=${{ env.WASMTIME_VERSION }}
+          provenance: true
+          sbom: true
+
+      - name: 摘要
+        run: |
+          {
+            echo "### 容器镜像已推送"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "wasm SHA-256: \`${{ needs.wasm.outputs.sha256 }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,150 @@
+name: CI
+
+# 每次 push / PR 都跑。这里刻意把「真实端到端」也纳入常规 CI：
+# 本工程踩过的两个最贵的坑（server flight 被合并进一条记录、
+# ClientVer 被服务端校验）都是**单元测试全绿**但对接真实服务端才暴露的。
+# 只跑单元测试的 CI 会放过它们。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # 与本地 scripts/env.sh 保持一致；用 XW_* 显式覆盖，
+  # 让 cargo 缓存落在 runner 的标准路径上以便被 actions/cache 命中。
+  XW_CARGO_HOME: ${{ github.workspace }}/.cargo-home
+  XW_TARGET_DIR: ${{ github.workspace }}/target
+  WASMTIME_VERSION: v48.0.2
+  XRAY_VERSION: v26.3.27
+  XRAY_ASSET: Xray-linux-64.zip
+
+jobs:
+  # ── 静态检查 + 单元测试 + wasm 构建 ──
+  build:
+    name: 构建与单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（含 wasm32-wasip2）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.XW_CARGO_HOME }}
+            ${{ env.XW_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy（warnings 视为错误）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --workspace
+
+      - name: 构建 wasm32-wasip2
+        run: cargo build -p xt-wasm-cli --release --target wasm32-wasip2
+
+      - name: 依赖树约束（不得引入 C++/mio）
+        run: |
+          # BoringSSL 是 C++、mio 依赖 epoll/kqueue —— 两者在 wasm 上都不可能工作。
+          # 一旦有人不小心把某条依赖链引进来，这里要立刻失败 ——
+          # 否则错误会以「wasm 构建在更晚的阶段莫名其妙地挂掉」的形式出现。
+          if cargo tree -p xt-wasm-cli --target wasm32-wasip2 \
+               | grep -iE 'boring|mio|parking_lot|socket2|openssl'; then
+            echo "::error::wasm 依赖树里出现了不该有的 C++/运行时依赖"
+            exit 1
+          fi
+          echo "依赖树干净"
+
+      - name: 生产代码不得引用 tokio runtime
+        run: |
+          # tokio 的 net/time/rt 等在 wasm 上是 compile_error! 或不可用。
+          # 只允许 io-util 的 trait 与工具。
+          if grep -rnE 'tokio::(net|time|spawn|runtime|fs|process|signal)' crates/*/src/; then
+            echo "::error::生产代码里出现了 tokio runtime 调用"
+            exit 1
+          fi
+          echo "无 tokio runtime 调用"
+
+      - name: 上传 wasm 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: xt-wasm-cli.wasm
+          path: ${{ env.XW_TARGET_DIR }}/wasm32-wasip2/release/xt-wasm-cli.wasm
+          if-no-files-found: error
+
+  # ── 真实端到端：wasm 客户端 → 真实 Xray REALITY 服务端 → 外网 ──
+  e2e:
+    name: 端到端（真实 Xray REALITY 服务端）
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（含 wasm32-wasip2）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.XW_CARGO_HOME }}
+            ${{ env.XW_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 安装 nc（e2e 脚本用它探测端口）
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends netcat-openbsd
+
+      - name: 下载 wasmtime
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/wasmtime.tar.xz \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          tar -xJf /tmp/wasmtime.tar.xz -C "$HOME"
+          echo "WASMTIME_BIN=$HOME/wasmtime-${WASMTIME_VERSION}-x86_64-linux/wasmtime" >> "$GITHUB_ENV"
+
+      - name: 下载 Xray-core（服务端基准）
+        run: |
+          set -eux
+          mkdir -p "$GITHUB_WORKSPACE/.xray"
+          curl -fsSL -o /tmp/xray.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_ASSET}"
+          unzip -q -o /tmp/xray.zip -d "$GITHUB_WORKSPACE/.xray"
+          chmod +x "$GITHUB_WORKSPACE/.xray/xray"
+          echo "XW_XRAY_BIN=$GITHUB_WORKSPACE/.xray/xray" >> "$GITHUB_ENV"
+
+      - name: 构建 wasm
+        run: cargo build -p xt-wasm-cli --release --target wasm32-wasip2
+
+      - name: 生成一次性测试服务端
+        run: ./scripts/gen-test-server.sh
+
+      - name: 端到端
+        run: |
+          set -eu
+          . .test-server/params.env
+          XW_XRAY_DIR="$PWD/.test-server" ./scripts/e2e-test.sh
+
+      - name: 失败时输出日志
+        if: failure()
+        run: |
+          echo "===== 服务端日志 ====="
+          cat .e2e-server.log 2>/dev/null || echo "(无)"
+          echo "===== 客户端日志 ====="
+          cat .e2e-client.log 2>/dev/null || echo "(无)"

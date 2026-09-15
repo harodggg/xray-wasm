@@ -34,8 +34,11 @@ XW_WS="$(cd "$XW_ROOT/.." && pwd)"
 #       "Operation not permitted" 或莫名其妙的 "No such file or directory"）。
 #       放工作区里，与 xray-tun 的做法一致。这里**无条件覆盖**，
 #       因为继承来的 CARGO_HOME 往往正指向那个不可写的位置。
-export CARGO_HOME="$XW_WS/.cargo"
-export CARGO_TARGET_DIR="$XW_WS/.cargo-target"
+#
+#       例外：CI 需要缓存落在 runner 的标准路径上，用 XW_CARGO_HOME /
+#       XW_TARGET_DIR 显式指定即可。
+export CARGO_HOME="${XW_CARGO_HOME:-$XW_WS/.cargo}"
+export CARGO_TARGET_DIR="${XW_TARGET_DIR:-$XW_WS/.cargo-target}"
 
 # 坑 2：系统里同时有 Homebrew 的 rustc(/usr/local/bin) 和 rustup 的 shim(~/.cargo/bin)，
 #       而 Homebrew 在 PATH 里更靠前。那样 rust-toolchain.toml 会被完全忽略，
@@ -71,7 +74,12 @@ export WASMTIME_BIN
 
 # 跑 wasm 必须带的 flag。缺 tcp=y 或 inherit-network=y 的失败信息很不直观
 # （后者表现为 error 2 = PermissionDenied，看起来像被墙）。
-XW_WASMTIME_ARGS="-S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y"
+#
+# inherit-env=y 是**安全相关**的：本工程支持用 XT_* 环境变量配置（k8s 里靠
+# Secret 注入）。如果漏掉它，环境变量根本进不了 guest —— 表现是「认证静默失效」，
+# 一个本应受保护的代理变成开放代理，而且绑回环时连警告都不会有。
+# 端到端脚本里的「无凭据必须被拒」用例就是为了钉住这一点。
+XW_WASMTIME_ARGS="-S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y -S inherit-env=y"
 export XW_WASMTIME_ARGS
 
 export XW_ROOT XW_WS

@@ -1,4 +1,4 @@
-//! 最小 SOCKS5 服务端（仅 CONNECT / 无认证）。
+//! 最小 SOCKS5 服务端（CONNECT + 可选用户名/密码认证）。
 //!
 //! # 为什么需要它
 //!
@@ -12,6 +12,15 @@
 //! 这也和官方客户端基准（`client.json` 里的 socks 入站 1080）完全对齐，
 //! 所以移植结果可以和官方实现**用同一条命令、同一套参数**对拍。
 //!
+//! # 认证不是可选项，而是安全问题
+//!
+//! 一个**无认证**的 SOCKS5 代理一旦绑到非回环地址，就是**开放代理**：
+//! 任何能连上该端口的人都能免费用你的隧道出去，流量与责任都算在你头上。
+//! 在 k8s 里这尤其危险 —— 做成 Service 之后，集群内任意 Pod 都能用它。
+//!
+//! 因此这里支持 RFC 1929 用户名/密码认证，并由调用方在
+//! 「绑定非回环 + 未设认证」时给出警告（见 `main.rs`）。
+//!
 //! # 范围
 //!
 //! 只实现 CONNECT。不支持 BIND / UDP ASSOCIATE —— 它们对「验证协议栈是否正确」
@@ -24,8 +33,13 @@ const VER: u8 = 5;
 
 /// 认证方式：无认证。
 const METHOD_NO_AUTH: u8 = 0x00;
+/// 认证方式：用户名/密码（RFC 1929）。
+const METHOD_USER_PASS: u8 = 0x02;
 /// 认证方式：无可接受的方法。
 const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
+
+/// RFC 1929 的子协商版本号。
+const USERPASS_VER: u8 = 0x01;
 
 /// 命令：CONNECT。
 const CMD_CONNECT: u8 = 0x01;
@@ -41,6 +55,13 @@ const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
+/// 期望的认证凭据。`None` 表示接受无认证连接。
+#[derive(Debug, Clone, Copy)]
+pub struct Credentials<'a> {
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
 /// 客户端请求连接的目标。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -51,34 +72,15 @@ pub enum Request {
     Unsupported { cmd: u8 },
 }
 
-/// 完成方法协商，然后读一条请求。
+/// 完成方法协商（含可选的用户名/密码认证），然后读一条请求。
 ///
 /// 协商阶段用的是**阻塞** IO：此时隧道还没建立，没有并发的读写要照顾，
 /// 阻塞写法最简单也最不容易错。
-pub fn negotiate_and_read_request<S: Read + Write>(sock: &mut S) -> io::Result<Request> {
-    // ── 方法协商 ──
-    let mut head = [0u8; 2];
-    sock.read_exact(&mut head)?;
-    if head[0] != VER {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("SOCKS 版本不支持：{}", head[0]),
-        ));
-    }
-    let nmethods = head[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    sock.read_exact(&mut methods)?;
-
-    if !methods.contains(&METHOD_NO_AUTH) {
-        sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE])?;
-        sock.flush()?;
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "客户端不支持「无认证」方式",
-        ));
-    }
-    sock.write_all(&[VER, METHOD_NO_AUTH])?;
-    sock.flush()?;
+pub fn negotiate_and_read_request<S: Read + Write>(
+    sock: &mut S,
+    creds: Option<Credentials<'_>>,
+) -> io::Result<Request> {
+    negotiate_method(sock, creds)?;
 
     // ── 请求 ──
     let mut req = [0u8; 4];
@@ -133,6 +135,107 @@ pub fn negotiate_and_read_request<S: Read + Write>(sock: &mut S) -> io::Result<R
     Ok(Request::Connect { host, port })
 }
 
+/// 方法协商 + （可选）RFC 1929 认证。
+fn negotiate_method<S: Read + Write>(
+    sock: &mut S,
+    creds: Option<Credentials<'_>>,
+) -> io::Result<()> {
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head)?;
+    if head[0] != VER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SOCKS 版本不支持：{}", head[0]),
+        ));
+    }
+    let nmethods = head[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    sock.read_exact(&mut methods)?;
+
+    match creds {
+        // 未配置认证：走 0x00。调用方负责警告「非回环且无认证」的风险。
+        None => {
+            if !methods.contains(&METHOD_NO_AUTH) {
+                sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE])?;
+                sock.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "客户端不支持「无认证」方式",
+                ));
+            }
+            sock.write_all(&[VER, METHOD_NO_AUTH])?;
+            sock.flush()?;
+            Ok(())
+        }
+        // 配置了认证：只接受 0x02，绝不回退到无认证。
+        Some(want) => {
+            if !methods.contains(&METHOD_USER_PASS) {
+                sock.write_all(&[VER, METHOD_NONE_ACCEPTABLE])?;
+                sock.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "服务端要求认证，但客户端未提供用户名/密码方式",
+                ));
+            }
+            sock.write_all(&[VER, METHOD_USER_PASS])?;
+            sock.flush()?;
+            verify_user_pass(sock, want)
+        }
+    }
+}
+
+/// RFC 1929：`VER(1) ULEN UNAME PLEN PASSWD`，应答 `VER(1) STATUS(1)`。
+fn verify_user_pass<S: Read + Write>(sock: &mut S, want: Credentials<'_>) -> io::Result<()> {
+    let mut ver = [0u8; 1];
+    sock.read_exact(&mut ver)?;
+    if ver[0] != USERPASS_VER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("用户名/密码子协商版本不支持：{}", ver[0]),
+        ));
+    }
+
+    let mut ulen = [0u8; 1];
+    sock.read_exact(&mut ulen)?;
+    let mut uname = vec![0u8; ulen[0] as usize];
+    sock.read_exact(&mut uname)?;
+
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen)?;
+    let mut passwd = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut passwd)?;
+
+    // 定长比较，避免因提前返回而泄漏长度信息。
+    // （本场景下时序攻击价值有限，但成本几乎为零，没有理由不做。）
+    let ok = constant_time_eq(&uname, want.username.as_bytes())
+        & constant_time_eq(&passwd, want.password.as_bytes());
+
+    // 无论成败都回一条，让客户端知道结果而不是干等。
+    sock.write_all(&[USERPASS_VER, if ok { 0x00 } else { 0x01 }])?;
+    sock.flush()?;
+
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SOCKS5 用户名或密码不正确",
+        ))
+    }
+}
+
+/// 长度无关的字节比较。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// 回一条成功应答。
 ///
 /// BND.ADDR/BND.PORT 填 0.0.0.0:0 —— 真实代理会填自己的出口地址，
@@ -169,7 +272,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     /// 起一对本地连接，把 `client_side` 的输出交给被测函数。
-    fn with_pair<F>(client_side: F) -> io::Result<Request>
+    fn with_pair<F>(client_side: F, creds: Option<Credentials<'static>>) -> io::Result<Request>
     where
         F: FnOnce(TcpStream) -> io::Result<()> + Send + 'static,
     {
@@ -180,25 +283,28 @@ mod tests {
             client_side(s).unwrap();
         });
         let mut server = TcpStream::connect(addr)?;
-        let r = negotiate_and_read_request(&mut server);
+        let r = negotiate_and_read_request(&mut server, creds);
         h.join().unwrap();
         r
     }
 
     #[test]
     fn parses_domain_connect_request() {
-        let req = with_pair(|mut s| {
-            s.write_all(&[5, 1, 0])?; // 问候：无认证
-            let mut reply = [0u8; 2];
-            s.read_exact(&mut reply)?;
-            assert_eq!(reply, [5, 0]);
-            // CONNECT example.com:443
-            s.write_all(&[5, 1, 0, 3, 11])?;
-            s.write_all(b"example.com")?;
-            s.write_all(&443u16.to_be_bytes())?;
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            Ok(())
-        })
+        let req = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 0])?; // 问候：无认证
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                assert_eq!(reply, [5, 0]);
+                // CONNECT example.com:443
+                s.write_all(&[5, 1, 0, 3, 11])?;
+                s.write_all(b"example.com")?;
+                s.write_all(&443u16.to_be_bytes())?;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            },
+            None,
+        )
         .unwrap();
 
         assert_eq!(
@@ -212,15 +318,18 @@ mod tests {
 
     #[test]
     fn parses_ipv4_connect_request() {
-        let req = with_pair(|mut s| {
-            s.write_all(&[5, 1, 0])?;
-            let mut reply = [0u8; 2];
-            s.read_exact(&mut reply)?;
-            s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1])?;
-            s.write_all(&8080u16.to_be_bytes())?;
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            Ok(())
-        })
+        let req = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 0])?;
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1])?;
+                s.write_all(&8080u16.to_be_bytes())?;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            },
+            None,
+        )
         .unwrap();
 
         assert_eq!(
@@ -234,20 +343,23 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_command_and_replies_with_correct_code() {
-        let req = with_pair(|mut s| {
-            s.write_all(&[5, 1, 0])?;
-            let mut reply = [0u8; 2];
-            s.read_exact(&mut reply)?;
-            // BIND (0x02) —— 不支持
-            s.write_all(&[5, 2, 0, 1, 127, 0, 0, 1])?;
-            s.write_all(&8080u16.to_be_bytes())?;
-            // 应答的第二个字节必须是 REP_COMMAND_NOT_SUPPORTED
-            let mut reject = [0u8; 10];
-            s.read_exact(&mut reject)?;
-            assert_eq!(reject[0], 5);
-            assert_eq!(reject[1], REP_COMMAND_NOT_SUPPORTED);
-            Ok(())
-        })
+        let req = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 0])?;
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                // BIND (0x02) —— 不支持
+                s.write_all(&[5, 2, 0, 1, 127, 0, 0, 1])?;
+                s.write_all(&8080u16.to_be_bytes())?;
+                // 应答的第二个字节必须是 REP_COMMAND_NOT_SUPPORTED
+                let mut reject = [0u8; 10];
+                s.read_exact(&mut reject)?;
+                assert_eq!(reject[0], 5);
+                assert_eq!(reject[1], REP_COMMAND_NOT_SUPPORTED);
+                Ok(())
+            },
+            None,
+        )
         .unwrap();
 
         assert_eq!(req, Request::Unsupported { cmd: 2 });
@@ -255,15 +367,137 @@ mod tests {
 
     #[test]
     fn rejects_client_without_no_auth_method() {
-        let err = with_pair(|mut s| {
-            s.write_all(&[5, 1, 2])?; // 只提供用户名密码认证
-            let mut reply = [0u8; 2];
-            s.read_exact(&mut reply)?;
-            assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
-            Ok(())
-        })
+        let err = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 2])?; // 只提供用户名密码认证
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
+                Ok(())
+            },
+            None,
+        )
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    // ─── 认证（RFC 1929）─────────────────────────────────────────────
+
+    const CREDS: Credentials<'static> = Credentials {
+        username: "alice",
+        password: "s3cr3t",
+    };
+
+    /// 认证成功：方法协商选 0x02，凭据正确后继续到请求解析。
+    #[test]
+    fn accepts_correct_credentials() {
+        let req = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 2])?; // 只提供用户名密码
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                assert_eq!(reply, [5, METHOD_USER_PASS], "必须选中 0x02");
+                // RFC 1929
+                s.write_all(&[1, 5])?;
+                s.write_all(b"alice")?;
+                s.write_all(&[6])?;
+                s.write_all(b"s3cr3t")?;
+                let mut auth = [0u8; 2];
+                s.read_exact(&mut auth)?;
+                assert_eq!(auth, [1, 0x00], "认证应成功");
+                // 继续发请求
+                s.write_all(&[5, 1, 0, 3, 11])?;
+                s.write_all(b"example.com")?;
+                s.write_all(&443u16.to_be_bytes())?;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            },
+            Some(CREDS),
+        )
+        .unwrap();
+
+        assert_eq!(
+            req,
+            Request::Connect {
+                host: "example.com".into(),
+                port: 443
+            }
+        );
+    }
+
+    /// 密码错误必须被拒绝，且回 0x01 而不是静默断开。
+    #[test]
+    fn rejects_wrong_password() {
+        let err = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 2])?;
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                s.write_all(&[1, 5])?;
+                s.write_all(b"alice")?;
+                s.write_all(&[5])?;
+                s.write_all(b"wrong")?;
+                let mut auth = [0u8; 2];
+                s.read_exact(&mut auth)?;
+                assert_eq!(auth, [1, 0x01], "认证应失败");
+                Ok(())
+            },
+            Some(CREDS),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// **关键安全属性**：配置了认证时，客户端即使声明支持「无认证」，
+    /// 也绝不能回退到无认证。
+    #[test]
+    fn never_falls_back_to_no_auth_when_credentials_are_configured() {
+        let err = with_pair(
+            |mut s| {
+                // 同时声明「无认证」和「用户名密码」
+                s.write_all(&[5, 2, 0, 2])?;
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                // 必须选 0x02，不能选 0x00
+                assert_eq!(
+                    reply,
+                    [5, METHOD_USER_PASS],
+                    "配置了认证却回退到无认证 = 开放代理"
+                );
+                Ok(())
+            },
+            Some(CREDS),
+        )
+        .unwrap_err();
+        // 客户端没继续发凭据就断了，报错即可
+        let _ = err;
+    }
+
+    /// 只支持无认证的客户端，在服务端要求认证时必须被拒。
+    #[test]
+    fn rejects_client_that_cannot_do_user_pass() {
+        let err = with_pair(
+            |mut s| {
+                s.write_all(&[5, 1, 0])?; // 只提供「无认证」
+                let mut reply = [0u8; 2];
+                s.read_exact(&mut reply)?;
+                assert_eq!(reply, [5, METHOD_NONE_ACCEPTABLE]);
+                Ok(())
+            },
+            Some(CREDS),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_normal_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

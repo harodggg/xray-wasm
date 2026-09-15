@@ -1,0 +1,76 @@
+# xray-wasm 作为集群内共享出口代理的 Deployment。
+#
+# 前置：先创建 Secret（见 secret.example.yaml）
+#
+# ⚠️ 关于并发的重要说明，部署前请务必读 deploy/k8s/README.md 的「已知限制」：
+# 当前实现一次只处理一条连接（wasip2 无线程）。replicas 设 2 以上可以让
+# 不同客户端落在不同 Pod 上，是目前缓解该限制的主要手段。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xray-wasm
+  labels:
+    app.kubernetes.io/name: xray-wasm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xray-wasm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: xray-wasm
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: proxy
+          image: ghcr.io/harodggg/xray-wasm:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # 必须绑 0.0.0.0 才能被其它 Pod 通过 Service 访问。
+            # 镜像默认是 127.0.0.1（安全默认值），这里显式放开。
+            # 同时 Secret 里必须配了认证 —— 否则这就是一个开放代理，
+            # 客户端启动时会打印显式警告。
+            - name: XT_LISTEN
+              value: "0.0.0.0:1080"
+          envFrom:
+            - secretRef:
+                name: xray-wasm
+          ports:
+            - name: socks
+              containerPort: 1080
+              protocol: TCP
+          # 探针说明：
+          # 因为一次只处理一条连接，探针连接可能排在正在进行的隧道后面而超时。
+          # 所以这里刻意把 failureThreshold 放宽、周期拉长 —— 目标是「发现真正卡死」
+          # 而不是「流量一大就重启」。startupProbe 负责确认监听已起来。
+          startupProbe:
+            tcpSocket:
+              port: socks
+            periodSeconds: 2
+            failureThreshold: 30
+          # 不设 livenessProbe：单连接模型下它更容易误杀而不是发现真问题。
+          # 这也是当前实现的限制之一，详见 README。
+          readinessProbe:
+            tcpSocket:
+              port: socks
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

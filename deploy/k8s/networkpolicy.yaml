@@ -1,0 +1,49 @@
+# 限制谁能连到这个代理。
+#
+# 为什么需要它：SOCKS5 认证解决「谁能用」，NetworkPolicy 解决「谁能连」。
+# 两层都做，才不至于因为一次密码泄漏或配置疏漏就把代理变成公开出口。
+#
+# 把下面的 `app.kubernetes.io/name: my-app` 换成实际需要使用代理的工作负载标签。
+# 注意：NetworkPolicy 需要集群的 CNI 支持（Calico/Cilium 等默认支持，
+# 部分托管集群的默认 CNI 不支持，策略会被静默忽略）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: xray-wasm-egress-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: xray-wasm
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # 只允许被明确标注的工作负载访问 SOCKS5 端口。
+    - from:
+        - podSelector:
+            matchLabels:
+              # ← 改成真正需要用代理的工作负载标签
+              app.kubernetes.io/name: my-app
+      ports:
+        - port: 1080
+          protocol: TCP
+    # 允许 kubelet 探针（不同 CNI/节点实现下来源网段不同，按需收紧或删除）
+    - ports:
+        - port: 1080
+          protocol: TCP
+
+  egress:
+    # 需要能连到 REALITY 服务端。生产环境请把这段收紧为服务端的固定 IP/网段，
+    # 避免这个 Pod 被当作跳板访问集群内其它东西。
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+    # DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

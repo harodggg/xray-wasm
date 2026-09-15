@@ -147,4 +147,4 @@ impl Metadata {
 
 pub mod vless;
 
-pub use vless::{addr_from_metadata, Cmd, VlessAddr, VlessConn, VisionConn};
+pub use vless::{addr_from_metadata, Cmd, VisionConn, VlessAddr, VlessConn};

@@ -1,0 +1,23 @@
+# 镜像构建上下文里只应该有 Dockerfile 与那个 wasm。
+# 这些是本地开发产物/缓存，混进去只会让上下文变大并破坏缓存。
+
+.git
+.github
+docs
+crates
+scripts
+deploy
+target
+
+# 本地运行产物
+.e2e-server.log
+.e2e-client.log
+.wasmtime-cache
+Cargo.lock
+Cargo.toml
+rust-toolchain.toml
+*.md
+.gitignore
+
+# 注意：LICENSE 与 LICENSE.meow-rs **不能**排除 —— MIT 要求在再分发时
+# 附带许可证，镜像里会 COPY 它们。

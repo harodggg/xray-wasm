@@ -1462,3 +1462,46 @@ Pending/Ready 双计数，同一复现，自旋稳定段：
 
 **最后一条是最省事、也最可能见效的**：既然纯 wstd 复现器不自旋，而我们的
 `NetStream` 是手写复刻，那就**直接不要这个复刻**。
+
+### V24 八续：核对「用 wstd 类型替掉手写 Ready」这条路 —— **不是 drop-in，比我说的更大**
+
+动手前先核对了 wstd 的 trait 形态：
+
+```rust
+// wstd-0.6.8/src/io/read.rs
+pub trait AsyncRead {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;   // ← async fn 风格
+    ...
+}
+```
+
+**wstd 的 `AsyncRead` 是 async-fn 风格，不是 `poll_read` 风格。**
+
+而本工程的协议层（TLS / REALITY / VLESS / Vision）全部依赖 **tokio 的
+`AsyncRead`/`AsyncWrite`**（poll 风格）。所以「把 `NetStream` 的手写 `Ready`
+换成 wstd 的 `AsyncInputStream`」**不是替换一个字段，而是要改掉整个 socket 层的
+trait 面** —— 那是一次重构，不是一次修改。
+
+我在上一轮把这条路说成「最省事、最可能见效」，**这个判断是错的**，特此更正。
+（这也是 V24 里第 N 次「先动手再核对」的教训：这次好在先核对了。）
+
+## 现在的确切位置
+
+* 5 个围绕「订阅怎么管」的假设全部实测排除；
+* 运行时（wstd/wasmtime）已证伪；
+* 确定：热循环是 `poll_read` 的就绪等待，被 ~20kHz 重轮询，而它**每次返回 Pending**
+  ⇒ **问题在「谁 poll 这个 future」，不在被 poll 的东西里**。
+
+## 建议的下一步（两选一，都不小）
+
+1. **在 `poll_read` 里记录当前任务的 waker**：20480 次/秒里是不是同一个 waker？
+   若 waker 每次都在变 ⇒ 有东西在反复重建任务/唤醒；
+   若同一个 ⇒ reactor 对这个 waitee 反复派发。
+   这是**最小、最直接**的一步，信息量最大。
+2. 若 1 指向 reactor 派发：写一个**只用我们自己 NetStream 的最小复现器**
+   （accept 一条 → 起任务 → 对它 `read`），把范围从「整个服务端」缩到
+   「我们的 NetStream + wstd executor」。这是继「我们 vs 运行时」之后的第二刀，
+   应该最先做 —— 它能把嫌疑从协议层彻底摘出去或钉死。
+
+**注意**：上面两条都还没做。V24 到此为止的所有结论都是**实测**的，
+但**这个 bug 仍然没有修复**。不要把它当成已解决。

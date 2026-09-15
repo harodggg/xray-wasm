@@ -1615,3 +1615,41 @@ match this.output.check_write() {
 
 （注意：本轮的 `hold.py` 客户端**从不读取**，所以写 15 字节不可能填满缓冲区 ——
 这条路径本不该等待。它却成了触发条件，说明问题多半就在这个「不该等待却等待了」的地方。）
+
+### V24 十二续：**机制抓到了 —— `check_write()` 永远返回 0**
+
+在只写探针（`stream_spin_probe_w.rs`）上给写路径加看门狗，自旋稳定段：
+
+```
+[WD] write_entry=18336  cw_zero=18336  wr_PENDING_on_zero=18336  flush_entry=144  flush_wr_PENDING=144
+[WD] write_entry=17657  cw_zero=17656  wr_PENDING_on_zero=17657  flush_entry=139  flush_wr_PENDING=139
+[WD] write_entry=18336  cw_zero=18336  wr_PENDING_on_zero=18336  flush_entry=144  flush_wr_PENDING=144
+```
+
+**`cw_zero` 与 `write_entry` 一个不差** ⇒
+
+> **`output.check_write()` 每一次都返回 0**（"现在写不进去"）⇒ `poll_write` 走 `Ok(0)` 分支
+> ⇒ `write_ready.poll()` 返回 `Pending`（同样一个不差）⇒ 任务挂起 ⇒ 被唤醒 ⇒ 重试 ⇒ 永远。
+
+**所以不是死循环，是「写永远完成不了」**：约 18,000 次/秒的重试，每次都要过一遍 WASI 调用
+（`check_write` + `subscribe` + 就绪判定），累计就把一核吃满了。这也解释了为什么
+CPU 是「一核」而不是「爆表」。
+
+### 为什么这件事很反常
+
+探针只写了 **15 字节**，而 `hold.py` 客户端**从不读取**。15 字节无论如何也填不满内核发送缓冲区
+—— **这条路径本不该返回「写不进去」。**
+
+`check_write()` 恒为 0，意味着 WASI 认为这个输出流**永远没有可写空间**。合理的怀疑方向（下一刀）：
+
+1. **发出去的字节没有真正落到 socket**：`output.write()` 之后没有真正 flush，
+   于是 WASI 侧的可写额度一直被占着（每连接 15 字节 × 300 条，若额度按连接而非按字节计，
+   就可能恒为 0）。
+2. `check_write()` 在**连接建立方式**上有前提没满足（我们建流的方式与 wstd 不同）。
+3. 对端不读时 wasmtime 的可写额度计算与预期不同。
+
+**下一刀**：在探针里把 `check_write()` 的**实际返回值**（不只是"是不是 0"）和
+`output.write()` 的调用次数/返回字节数一起记录；再试一个**顺序写 1 字节就立刻 flush**
+的变体。判据不变，几十秒一次。
+
+至今**仍未修复**。

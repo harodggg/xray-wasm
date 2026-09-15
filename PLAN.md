@@ -111,17 +111,25 @@ xray-wasm/
 | M1 | 移植 `reality_tls.rs`，剥离 tokio runtime | wasm 内完成一次到**真实 Xray REALITY 服务端**的 TLS1.3 握手，且服务端确认 `isHandshakeComplete=true` | ✅ **完成**（V11 修复 + V12，226ms） |
 | M2 | 移植 VLESS 头 + Vision | 能将一个 TCP 流经隧道送到目标并回传 | ✅ **完成**（V13，服务端日志 `received request for tcp:example.com:443`） |
 | M3 | CLI + 本地端到端 | 经 wasm 隧道拿到真实网页 | ✅ **完成**（V13，`curl --proxy socks5h://…` → HTTP 200） |
-| M4 | 硬化 | 超时/错误路径、无 `unwrap` panic、与 stock Xray 客户端对拍线格式 | 🟡 **部分完成**：对拍见 V14（`ServerHello` 127 字节与官方一致），并修复了 `ClientVer` 互通缺陷；错误路径与 panic 审计仍待做 |
+| M4 | 硬化 | 超时/错误路径、无 `unwrap` panic、与 stock Xray 客户端对拍线格式 | ✅ **完成**（V14 对拍 `ServerHello` 127 字节与官方一致并修复 `ClientVer` 互通；V16/V17 换成非阻塞 socket + reactor 就绪通知；对拍与错误路径用例均入 CI） |
+| M5 | REALITY **入站**（服务端） | stock Xray 客户端经我们的服务端代理到真实网站；未认证探测者看到 `dest` 的真实证书 | ✅ **完成**（V18/V19/V20，六个阶段全部落地） |
+| M6 | 服务端 CLI + k3s 交付 | `server` 子命令、两个方向的 e2e 入 CI、可部署清单、发版产物 | ✅ **完成**（V21） |
 
-**验收现状**：`cargo test --workspace` → 59 passed / 0 failed；
-`./scripts/e2e-test.sh` → 端到端通过。详见 `docs/verification-log.md` V13/V15。
+**验收现状**：`cargo test --workspace` → 100 passed / 0 failed；
+`./scripts/check.sh`（本地与 CI 同一条命令）全绿；
+`./scripts/e2e-test.sh`（我们的客户端 → stock 服务端）与
+`./scripts/e2e-server-test.sh`（stock 客户端 → 我们的服务端）双向通过。
+详见 `docs/verification-log.md` V13/V15/V21。
 
 ### 尚未完成的事项（诚实列出）
 
 1. **TLS 指纹仍是手写形状**，未实现 uTLS 的 Chrome 伪装（见 §7 风险表）。
    功能可用，但抗 JA3/JA4 与主动探测能力弱于官方客户端。
-2. **未实现 XTLS-Vision 的 DIRECT splice 性能优化**（功能正确，仅性能差异）。
-3. **未做 UDP / Mux / 后量子（ML-KEM、ML-DSA-65）**，均在范围内明确排除。
+2. **服务端侧 XTLS-Vision 未实现**：客户端必须把 `flow` 留空，
+   带非空 flow 的请求会被**明确拒绝**（不会静默降级）。
+   这是协议部分唯一还没做的功能。
+3. **未实现 XTLS-Vision 的 DIRECT splice 性能优化**（功能正确，仅性能差异）。
+4. **未做 UDP / Mux / 后量子（ML-KEM、ML-DSA-65）**，均在范围内明确排除。
 
 > 并发与调度已不再是限制：
 > * v0.2 起改为**非阻塞并发**，一条长连接不再独占进程（V16，A/B 实测）；

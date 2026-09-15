@@ -54,14 +54,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: 格式检查
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: 单元测试
-        run: cargo test --workspace
+      # 与 ci.yml 一样调用 scripts/check.sh，而不是在这里手抄一遍步骤。
+      # 手抄过一次就会漂移一次：发版路径上的检查比 CI 更不该有独立实现。
+      - name: 跑全部检查（与 CI 同一条命令）
+        run: ./scripts/check.sh
 
   wasm:
     name: 构建 wasm 包
@@ -126,7 +122,10 @@ jobs:
 
             wasm 模块 SHA-256：`${{ steps.hash.outputs.sha256 }}`
 
-            ## 直接运行 wasm 模块
+            同一个模块跑**两种模式**：默认是客户端（socket → REALITY），
+            `server` 子命令是服务端（REALITY 入站）。
+
+            ## 客户端：本地 SOCKS5 → REALITY 隧道
 
             ```sh
             wasmtime run -C cache=n \
@@ -135,6 +134,25 @@ jobs:
               --server <ip:port> --pbk <公钥> --sid <shortId> \
               --sni <伪装域名> --uuid <uuid> --listen 127.0.0.1:1080
             ```
+
+            ## 服务端：REALITY 入站（k3s 用）
+
+            ```sh
+            wasmtime run -C cache=n \
+              -S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y -S inherit-env=y \
+              xt-wasm-cli.wasm server \
+              --listen 0.0.0.0:8443 \
+              --private-key <xray x25519 的 PrivateKey> \
+              --short-ids <hex> \
+              --server-names <伪装域名> \
+              --dest <同一个域名的 host:port> \
+              --users <uuid>
+            ```
+
+            全部参数都有对应的 `XT_*` 环境变量（命令行优先），便于 k8s 用 Secret 注入。
+
+            > **客户端 `flow` 必须留空**：服务端侧 XTLS-Vision 尚未实现，
+            > 带非空 flow 的请求会被**明确拒绝**（不是静默降级）。
 
             > 四个 `-S` flag 缺一不可。尤其 `inherit-network=y` 缺失时报的是
             > `PermissionDenied`，很容易被误读成「网络被墙」。
@@ -147,7 +165,14 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
             ```
 
-            部署清单与安全须知见仓库 `deploy/k8s/`。
+            ```sh
+            # 客户端
+            docker run --rm -e XT_SERVER=… -e XT_PBK=… ghcr.io/${{ github.repository }}:${{ github.event.inputs.tag || github.ref_name }}
+            # 服务端（子命令写在镜像名之后）
+            docker run --rm -e XT_PRIVATE_KEY=… ghcr.io/${{ github.repository }}:${{ github.event.inputs.tag || github.ref_name }} server
+            ```
+
+            部署清单（客户端与服务端各一套）与安全须知见仓库 `deploy/k8s/`。
 
             ## 校验
 

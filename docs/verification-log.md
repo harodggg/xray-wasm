@@ -1313,3 +1313,35 @@ read_empty ≈ 26（全程）
 若 Pending 占绝对多数却仍被高频重轮询，就证明唤醒来自**我们这个 pollable 之外**
 （例如同进程里另一个 pollable 的事件 wake 到了共用 waker），
 那就要往 wstd reactor 的 `wakers` 映射与 `ready_list` 去查 —— 而不是再动协议代码。
+
+### V24 四续：**决定性结果 —— 就绪轮询一直返回 READY**（上一个假设被推翻）
+
+Pending/Ready 双计数，同一复现，自旋稳定段：
+
+```
+[WD] Ready::poll=20480  read_top=20480  ready_got_READY=20480
+[WD] Ready::poll=20480  read_top=20480  ready_got_READY=20480      ← 连续稳定
+```
+
+* `ready_got_READY` = 20,480 次/秒 ⇒ **每一次就绪轮询都返回就绪**。
+* `ready_got_pending` = **0**（从未打印）。
+* `waitfor_created` = 0（从未打印）⇒ `WaitFor` 只建了一次就被跨 poll 复用。
+
+**这推翻了我上一条的假设**（「任务被虚假唤醒、而 pollable 说没就绪」）。
+真相相反：**我们缓存的 `AsyncPollable` 一直报就绪，所以 `Ready::poll` 立刻返回 Ready，
+`poll_read` 的循环于是空转。**
+
+机制现在完全说得通了：WASI 的 pollable 是**一次就绪后持续就绪**（除非重新 `subscribe`）。
+我们在 `OnceLock` 里把它缓存成一辈子一颗，所以：
+
+* 空闲时它还没触发过 ⇒ 不报就绪 ⇒ CPU 0（这就是「只有来过事件之后才发作」的原因）；
+* 第一次事件之后它永久报就绪 ⇒ `Ready::poll` 立刻返回 ⇒ 上层重试 ⇒ 立刻又返回 ⇒
+  20,480 Hz 忙等，永不恢复。
+
+**注意这和我第二次尝试的改动是同一件事** —— 那次没生效，是因为我**同时**改了空读逻辑
+（`resubscribe` + 判 EOF 两处一起上），两个改动互相掩盖，无法归因。
+正确做法是**只改这一处**再测。
+
+**待验证的一个探针**：`read_empty` 这次没打印（`probe::hit(2)` 的锚点可能又没匹配上）。
+若 `Ready::poll` 一直 Ready 而 `read_empty` 仍为 0，说明 `input.read()` 返回的是数据或
+错误而不是空 —— 这一点需要在下一轮一并确认，它会决定修法是「重新订阅」还是「换判据」。

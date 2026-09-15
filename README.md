@@ -236,16 +236,25 @@ REALITY 有两个方向，本工程只实现了其中**一个**：
 | X25519 / HKDF-SHA256 / AES-256-GCM | ✅ 客户端侧已在用，服务端侧同一套原语 |
 | 出站 `dest` 的 TLS 1.3 客户端 | ✅ 已有（虽然是自己手写的那套） |
 
-**缺的是协议实现本身**，而且这块不小：
+**缺的是协议实现本身**，而且这块不小。按可验证性拆成六个阶段，进度如下：
 
-| # | 要做的 | 为什么不能直接复用现有代码 |
+| # | 要做的 | 状态 |
 |---|---|---|
-| 1 | **完整的 TLS 1.3 服务端握手** | 现有代码只有**客户端**角色。ServerHello / EncryptedExtensions / Certificate / CertificateVerify / Finished 的服务端构造、以及服务端密钥调度都要新写 |
-| 2 | **每连接生成临时 ed25519 证书** | REALITY 的核心反探测机制。客户端校验证书的方式是 `HMAC-SHA512(authKey, 证书公钥) == 证书签名域`，所以服务端必须**用 HMAC 冒充签名字段** |
-| 3 | **X.509 DER 编码** | 上面那张证书要自己拼 DER（TBSCertificate + 伪造的 signatureValue）。这块繁琐且容易出错 |
-| 4 | **服务端侧 REALITY 认证** | 反向做客户端那套：ECDH → HKDF → AES-GCM 解密 `session_id` → 校验版本 / 时钟窗口 / shortId |
-| 5 | **VLESS 服务端解码 + Vision 服务端流控** | 现有的是编码方向（客户端）；解码方向在上游移植时被排除了 |
-| 6 | **`dest` 回退** | 认证失败的连接必须**原样转发**到真实站点，让主动探测者看到真实网站——这是 REALITY 抗探测的根本，缺了它整个方案失去意义 |
+| 4 | **服务端侧 REALITY 认证** —— ECDH → HKDF → AES-GCM 解密 `session_id` → 校验版本 / 时钟窗口 / shortId | ✅ **已完成** |
+| 2 | **每连接伪造临时 ed25519 证书** —— 客户端校验的是 `HMAC-SHA512(authKey, 证书公钥) == 证书签名域`，所以服务端要**用 HMAC 冒充签名字段** | ✅ **已完成** |
+| 3 | **X.509 DER 编码** —— 手工拼 TBSCertificate + 伪造的 signatureValue | ✅ **已完成** |
+| 1 | **完整的 TLS 1.3 服务端握手** —— ServerHello / EncryptedExtensions / Certificate / CertificateVerify / Finished 的服务端构造与服务端密钥调度 | ⬜ 未开始 |
+| 5 | **VLESS 服务端解码 + Vision 服务端流控** —— 现有的是编码方向（客户端），解码方向在移植时被排除了 | ⬜ 未开始 |
+| 6 | **`dest` 回退** —— 认证失败的连接必须**原样转发**到真实站点，让主动探测者看到真实网站 | ⬜ 未开始 |
+
+已完成的三个阶段的代码在 `crates/xt-wasm-tls/src/reality_server.rs`，
+验证过程见 [`docs/verification-log.md`](docs/verification-log.md) 的 **V18**。
+其中最有力的一条是**跨实现**的：拿**官方 Xray 客户端真实发出的 ClientHello**
+（chrome 指纹、1787 字节、带 GREASE、三份 key_share）当夹具，
+我们的服务端能解析并认证通过，还原出 shortId 与客户端版本。
+
+> 顺带确认了一件事：官方 chrome 指纹**同时**发纯 X25519 key_share
+> （不是只有 X25519MLKEM768），所以服务端不必实现 ML-KEM 就能取到共享密钥。
 
 参考：上游 `xtls/reality` 是一个 **15,584 行的 Go 包**（本质是 `crypto/tls` 的完整 fork），
 服务端相关逻辑主要在其中。**没有任何现成的 Rust 实现可以移植** ——
@@ -254,8 +263,9 @@ crates.io 上也没有可用的 REALITY 服务端 crate。
 
 ### 如果要做，规模大概是多少
 
-诚实估计：**不小于本工程到目前为止的全部工作量**，主要成本在第 1、2、3 项
-（TLS 服务端 + 证书伪造 + DER 编码）。第 4、5 项反而是最轻的，因为原语和线格式都清楚。
+诚实估计：**不小于本工程到目前为止的全部工作量**，主要成本在第 1 项
+（TLS 服务端握手）。第 2、3、4 项已经做完了，比预想的轻 ——
+因为原语和线格式都清楚，且能用「我们自己的客户端」当第一个验证器。
 
 ### 安全考量（若将来实现）
 

@@ -1543,3 +1543,32 @@ socket 层不背锅、只有协议层参与才发作」的形状。
 **下一步**：在 `stream_spin_probe` 上**逐条加上协议层的特征**（先只加一层
 `timeout(...)` 包住 read，再加读写交替），看加到哪一步开始自旋。
 这是第三刀，也是最可能直接定位的一刀。
+
+### V24 十续：第三刀 · 第 1 步 —— 加一层 `timeout(...)`（**不自旋**）
+
+在 `stream_spin_probe` 上**只加一层** `xt_wasm_runtime::timeout(Duration::from_secs(3600), s.read(&mut buf))`，
+其余一字未动。新探针：`crates/xt-wasm-runtime/examples/stream_spin_probe_timeout.rs`
+（原探针保留，未改动）。
+
+```
+socket 层探针（无 timeout）        300 条悬停 → 0 ticks
+socket 层探针 + timeout(...)      300 条悬停 → 0 ticks   ← 本次
+完整服务端（协议层）               300 条悬停 → 501 ticks
+```
+
+**`timeout` 这一层不是触发条件。** 我上一轮把它列为「最可疑」是**判断错了** ——
+`futures::future::select` 把两个 future 塞进同一个 task 这个结构本身，
+单独用并不会引发自旋。
+
+## 第三刀 · 第 2 步（下一个该试的）
+
+继续在 socket 层探针上**逐条**加协议层的特征，一次只加一条：
+
+2. **读写交替**：握手期对同一条流反复 `read`/`write`（ClientHello → ServerHello →
+   证书 → …），waker 在同一条流的读写两侧被反复注册/注销。
+3. 若 2 也不自旋：加**多层包装**（`RealityTlsStream` 把 `NetStream` 包起来，
+   外层 TLS 与内层 VLESS 对同一条底层流各自持有等待）。
+
+判据不变：`/proc/<pid>/stat` 的 5 秒 CPU 增量，0 = 正常，~500 = 自旋。
+
+**注意**：至今为止**这个 bug 仍未修复**。已排除的假设增至 6 个。

@@ -285,8 +285,41 @@ jobs:
 
             全部参数都有对应的 `XT_*` 环境变量（命令行优先），便于 k8s 用 Secret 注入。
 
-            > **客户端 `flow` 必须留空**：服务端侧 XTLS-Vision 尚未实现，
-            > 带非空 flow 的请求会被**明确拒绝**（不是静默降级）。
+            ## 互操作（哪两端、要不要 `--no-flow`）
+
+            | 客户端 | 服务端 | 结果 |
+            |---|---|---|
+            | 官方 Xray（v2rayN / 小火箭 / `xray` 二进制） | 本工程 wasm 服务端 | ✅ 配置里 `flow` 必须留空 |
+            | 本工程 wasm 客户端（默认） | 官方 Xray 服务端 | ✅ |
+            | 本工程 wasm 客户端 `--no-flow` | 本工程 wasm 服务端 | ✅ |
+            | 本工程 wasm 客户端（默认带 Vision） | 本工程 wasm 服务端 | ❌ 被**明确拒绝**，不静默降级 |
+
+            > **`--no-flow`（或 `XT_NO_FLOW=1`）同时关掉 flow 声明和客户端侧 Vision 分帧。**
+            > 只关一半会得到「连上了但数据是坏的」—— 两者必须同进同退。
+
+            > 服务端侧 XTLS-Vision 尚未实现：带非空 flow 的请求会被**明确拒绝**，
+            > `reason` 里会写清客户端该怎么改。
+
+            ## 服务端可观测性
+
+            一次请求一行，字段固定；`outcome=` 取值
+            `Forwarded | FellBack | Rejected | ResolveFailed | ConnectFailed`（外加 `Error`）：
+
+            ```
+            [server] ts=2026-09-15T11:41:12Z dir=in src=10.0.0.5:51234 sni=www.example.com \
+                     ver=26.3.27 sid=0011223344556677 target=example.com:443 outcome=Forwarded \
+                     dur_ms=1320 up_bytes=585 down_bytes=4867
+            ```
+
+            配置自检（**不监听**，只打印生效配置并退出）：
+
+            ```sh
+            XT_CHECK=1 <上面的 XT_* 变量> wasmtime run … xt-wasm-cli.wasm server
+            ```
+
+            > ⚠️ **wasmtime 会把 guest 的退出码塌缩成 1**（实测 `exit(2)`/`exit(42)` 都得到 1）。
+            > `--check` 的契约可观察到的只有 **0 / 非 0**；写成 `== 2` 的断言在宿主上过、
+            > 在 wasm 上必红。
 
             > 四个 `-S` flag 缺一不可。尤其 `inherit-network=y` 缺失时报的是
             > `PermissionDenied`，很容易被误读成「网络被墙」。

@@ -213,8 +213,9 @@ REALITY 有两个方向，本工程只实现了其中**一个**：
 
 ### 但这不代表「REALITY → socket」做不到
 
-**官方 Xray 服务端做的就是这件事**，而且本工作区的
-[`xray-deploy/install-xray.sh`](../xray-deploy/install-xray.sh) 已经能一键部署它：
+**官方 Xray 服务端做的就是这件事**，而且与本工程同属一个工作区的
+[`harodggg/xray-deploy`](https://github.com/harodggg/xray-deploy) 里的
+`install-xray.sh` 已经能一键部署它：
 服务端配置就是 `inbound: vless + reality` + `outbound: freedom` ——
 接住 REALITY、解封装、再直连目标。装完还会直接用官方客户端自测一遍并输出分享链接。
 

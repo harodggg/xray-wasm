@@ -1572,3 +1572,46 @@ socket 层探针 + timeout(...)      300 条悬停 → 0 ticks   ← 本次
 判据不变：`/proc/<pid>/stat` 的 5 秒 CPU 增量，0 = 正常，~500 = 自旋。
 
 **注意**：至今为止**这个 bug 仍未修复**。已排除的假设增至 6 个。
+
+### V24 十一续：**第三刀命中 —— 触发条件是「写」这条路径**（40 行、无协议层的最小复现）
+
+沿第三刀继续在 socket 层探针上逐条加协议层特征，一次只加一条：
+
+```
+socket 层 + 只读（read 悬停）      0 ticks
+socket 层 + timeout + read         0 ticks
+socket 层 + 只写不读               501 ticks   ← 自旋
+socket 层 + 读写交替               501 ticks   ← 自旋
+```
+
+**结论：只要往流上写过（`write_all` + `flush`），300 条悬停连接就会自旋；只读不会。**
+
+这比我预期的好得多 —— 现在有了一个**不含 TLS/VLESS 任何代码、几十行**的最小复现：
+
+* `crates/xt-wasm-runtime/examples/stream_spin_probe_w.rs`（只写不读，自旋）
+* `crates/xt-wasm-runtime/examples/stream_spin_probe_rw.rs`（读写交替，自旋）
+* `crates/xt-wasm-runtime/examples/stream_spin_probe.rs`（只读，不自旋 ← 对照组）
+
+探针都保留在仓库里，判据统一是 `/proc/<pid>/stat` 的 5 秒 CPU 增量。
+
+**写路径上最可疑的一处**（`wasi.rs` 的 `poll_write`）：
+
+```rust
+match this.output.check_write() {
+    Ok(0) => {
+        if this.write_ready.poll(&|| this.output.subscribe(), cx).is_pending() {
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(0))          // ← 「就绪了但写不进」
+    }
+    ...
+}
+```
+
+`check_write()` 返回 0（写不进去）却又拿到就绪，然后返回 `Ok(0)`。而 `poll_flush`
+里也有一处 `write_ready.poll(...)`。**下一刀就在这两处**：
+把 `output.check_write()` 的返回值与 `write_ready.poll` 的结果**同时记录**，
+看是不是「一直拿到就绪、但永远写不进」⇒ 上层反复重试 ⇒ 忙等。
+
+（注意：本轮的 `hold.py` 客户端**从不读取**，所以写 15 字节不可能填满缓冲区 ——
+这条路径本不该等待。它却成了触发条件，说明问题多半就在这个「不该等待却等待了」的地方。）

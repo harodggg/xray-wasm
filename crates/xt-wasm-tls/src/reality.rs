@@ -41,18 +41,18 @@ use crate::{
 type HmacSha256 = Hmac<Sha256>;
 pub(crate) type HmacSha512 = Hmac<Sha512>;
 
-const TLS_RECORD_HANDSHAKE: u8 = 22;
-const TLS_RECORD_APPLICATION_DATA: u8 = 23;
-const TLS_RECORD_ALERT: u8 = 21;
-const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
+pub(crate) const TLS_RECORD_HANDSHAKE: u8 = 22;
+pub(crate) const TLS_RECORD_APPLICATION_DATA: u8 = 23;
+pub(crate) const TLS_RECORD_ALERT: u8 = 21;
+pub(crate) const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
 
-const HS_CLIENT_HELLO: u8 = 1;
-const HS_SERVER_HELLO: u8 = 2;
+pub(crate) const HS_CLIENT_HELLO: u8 = 1;
+pub(crate) const HS_SERVER_HELLO: u8 = 2;
 const HS_NEW_SESSION_TICKET: u8 = 4;
-const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
-const HS_CERTIFICATE: u8 = 11;
-const HS_CERTIFICATE_VERIFY: u8 = 15;
-const HS_FINISHED: u8 = 20;
+pub(crate) const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
+pub(crate) const HS_CERTIFICATE: u8 = 11;
+pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
+pub(crate) const HS_FINISHED: u8 = 20;
 
 pub(crate) const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 
@@ -367,6 +367,33 @@ pub struct RealityTlsStream {
 }
 
 impl RealityTlsStream {
+    /// 服务端握手完成后构造流。
+    ///
+    /// **注意读写密钥与客户端是反的**：服务端用握手得到的 `server` 密钥写、
+    /// 用 `client` 密钥读。（客户端那边正好相反。）
+    ///
+    /// 复用同一个流类型而不是给服务端另写一个：记录层的分帧、重放保护、
+    /// 半关闭处理逻辑两侧完全一样，没必要写两遍。
+    pub(crate) fn from_keys(
+        inner: Box<dyn Stream>,
+        read_key: RecordKey,
+        write_key: RecordKey,
+    ) -> Self {
+        Self {
+            inner,
+            read_key,
+            write_key,
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        }
+    }
+
     /// Switch the read side to raw splice mode (XTLS-Vision DIRECT).
     pub fn enable_raw_read_passthrough(&mut self) {
         self.read_raw_passthrough = true;
@@ -871,9 +898,9 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
 }
 
 pub(crate) struct TlsRecord {
-    header: [u8; 5],
-    typ: u8,
-    payload: Vec<u8>,
+    pub(crate) header: [u8; 5],
+    pub(crate) typ: u8,
+    pub(crate) payload: Vec<u8>,
 }
 
 pub(crate) async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
@@ -1194,7 +1221,7 @@ pub(crate) enum CipherSuite {
 }
 
 impl CipherSuite {
-    fn try_from(value: u16) -> Result<Self> {
+    pub(crate) fn try_from(value: u16) -> Result<Self> {
         match value {
             TLS_AES_128_GCM_SHA256 => Ok(Self::Aes128GcmSha256),
             other => Err(TransportError::Tls(format!(
@@ -1203,7 +1230,7 @@ impl CipherSuite {
         }
     }
 
-    fn key_len(self) -> usize {
+    pub(crate) fn key_len(self) -> usize {
         match self {
             Self::Aes128GcmSha256 => 16,
         }
@@ -1211,15 +1238,15 @@ impl CipherSuite {
 }
 
 pub(crate) struct HandshakeKeys {
-    client: RecordKey,
-    server: RecordKey,
-    client_secret: [u8; 32],
-    server_secret: [u8; 32],
-    master_secret: [u8; 32],
+    pub(crate) client: RecordKey,
+    pub(crate) server: RecordKey,
+    pub(crate) client_secret: [u8; 32],
+    pub(crate) server_secret: [u8; 32],
+    pub(crate) master_secret: [u8; 32],
 }
 
 impl HandshakeKeys {
-    fn derive(cipher: CipherSuite, shared_secret: &[u8; 32], transcript: &[u8]) -> Self {
+    pub(crate) fn derive(cipher: CipherSuite, shared_secret: &[u8; 32], transcript: &[u8]) -> Self {
         let zero = [0u8; 32];
         let empty_hash = Sha256::digest([]);
         let early_secret = hkdf_extract(&zero, &zero);
@@ -1241,12 +1268,12 @@ impl HandshakeKeys {
 }
 
 pub(crate) struct ApplicationKeys {
-    client: RecordKey,
-    server: RecordKey,
+    pub(crate) client: RecordKey,
+    pub(crate) server: RecordKey,
 }
 
 impl ApplicationKeys {
-    fn derive(cipher: CipherSuite, master_secret: &[u8; 32], transcript: &[u8]) -> Self {
+    pub(crate) fn derive(cipher: CipherSuite, master_secret: &[u8; 32], transcript: &[u8]) -> Self {
         let transcript_hash = Sha256::digest(transcript);
         let client_secret = derive_secret(master_secret, b"c ap traffic", &transcript_hash);
         let server_secret = derive_secret(master_secret, b"s ap traffic", &transcript_hash);
@@ -1268,7 +1295,7 @@ pub(crate) struct RecordKey {
 }
 
 impl RecordKey {
-    fn new(cipher_suite: CipherSuite, secret: &[u8; 32]) -> Self {
+    pub(crate) fn new(cipher_suite: CipherSuite, secret: &[u8; 32]) -> Self {
         let key = hkdf_expand_label(secret, b"key", &[], cipher_suite.key_len());
         let iv = hkdf_expand_label(secret, b"iv", &[], 12);
         let mut iv_arr = [0u8; 12];
@@ -1285,7 +1312,7 @@ impl RecordKey {
         }
     }
 
-    fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut body = Vec::with_capacity(plaintext.len() + 1 + 16);
         body.extend_from_slice(plaintext);
         body.push(inner_type);
@@ -1308,7 +1335,7 @@ impl RecordKey {
         Ok(out)
     }
 
-    fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
+    pub(crate) fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
         if ciphertext.len() < 16 {
             return Err(TransportError::Tls("TLS ciphertext too short".into()));
         }
@@ -1372,7 +1399,7 @@ fn verify_finished(secret: &[u8; 32], transcript: &[u8], received: &[u8]) -> Res
     }
 }
 
-fn finished_verify_data(secret: &[u8; 32], transcript: &[u8]) -> Vec<u8> {
+pub(crate) fn finished_verify_data(secret: &[u8; 32], transcript: &[u8]) -> Vec<u8> {
     let finished_key = hkdf_expand_label(secret, b"finished", &[], 32);
     let transcript_hash = Sha256::digest(transcript);
     let mut h = <HmacSha256 as Mac>::new_from_slice(&finished_key).expect("HMAC key");
@@ -1380,7 +1407,7 @@ fn finished_verify_data(secret: &[u8; 32], transcript: &[u8]) -> Vec<u8> {
     h.finalize().into_bytes().to_vec()
 }
 
-fn derive_secret(secret: &[u8; 32], label: &[u8], transcript_hash: &[u8]) -> [u8; 32] {
+pub(crate) fn derive_secret(secret: &[u8; 32], label: &[u8], transcript_hash: &[u8]) -> [u8; 32] {
     let expanded = hkdf_expand_label(secret, label, transcript_hash, 32);
     let mut out = [0u8; 32];
     out.copy_from_slice(&expanded);

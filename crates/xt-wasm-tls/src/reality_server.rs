@@ -42,17 +42,25 @@
 //! 本文件目前只做**认证 + 证书**。完整服务端还需要 TLS 1.3 服务端握手、
 //! VLESS 解码与 `dest` 回退，见 README 的「REALITY 入站」一节。
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
+use ed25519_dalek::{Signer, SigningKey};
 use hmac::Mac;
+use rand::RngCore;
+use tokio::io::AsyncWriteExt;
 
-use crate::reality::{hkdf_sha256, x25519, HmacSha512};
-use crate::{Result, TransportError};
+use crate::reality::{
+    clamp_x25519_private, finished_verify_data, hkdf_sha256, read_record, wrap_plain_record,
+    x25519, x25519_public_from_private, ApplicationKeys, CipherSuite, HandshakeKeys, HmacSha512,
+    RealityTlsStream, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO,
+    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, TLS_AES_128_GCM_SHA256,
+    TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
+};
+use crate::{Result, Stream, TransportError};
 
-/// 握手消息类型：ClientHello。
-const HS_CLIENT_HELLO: u8 = 1;
-
-/// `supported_groups` 里的 X25519。
+/// `supported_groups` / `key_share` 里的 X25519。
 const GROUP_X25519: u16 = 0x001d;
 
 /// session_id 字段固定 32 字节（REALITY 强制）。
@@ -328,6 +336,16 @@ pub fn authenticate(
 ///
 /// 客户端只做一件事：`HMAC-SHA512(AuthKey, 证书公钥) == 证书签名字段`。
 /// 所以这里用 HMAC 填 `signatureValue`，而不是真的去签名。
+///
+/// # 为什么必须是一张**结构完整**的 X.509
+///
+/// 第一版为了省事，issuer / validity / signatureAlgorithm 都写成空 SEQUENCE，
+/// 结果：**我们自己的客户端能过，官方客户端直接回 `bad_certificate` 告警**。
+/// 原因是我们客户端的解析器只按位置取 SPKI，而官方客户端用的是 Go 真正的
+/// `x509.ParseCertificate` —— 空 Name、空 Validity、空 AlgorithmIdentifier
+/// 都不是合法 DER，它解析失败就退回 CA 链校验，必然失败。
+///
+/// 教训：**能被自己解析 ≠ 是合法的编码**。所以这里老老实实拼一份完整的证书。
 pub fn forge_certificate(auth_key: &[u8; 32], ed25519_pubkey: &[u8; 32]) -> Vec<u8> {
     let signature = {
         let mut mac =
@@ -336,32 +354,45 @@ pub fn forge_certificate(auth_key: &[u8; 32], ed25519_pubkey: &[u8; 32]) -> Vec<
         mac.finalize().into_bytes().to_vec()
     };
 
-    // SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier(Ed25519), BIT STRING(pubkey) }
-    let alg = der(0x30, &der(0x06, &[0x2b, 0x65, 0x70])); // OID 1.3.101.112
+    // AlgorithmIdentifier：Ed25519（OID 1.3.101.112，无参数）
+    let alg_id = der(0x30, &der(0x06, &[0x2b, 0x65, 0x70]));
+
+    // Name：单个 RDN，CN=<名字>。issuer 与 subject 用同一个。
+    let cn = der(0x0c, b"reality"); // UTF8String
+    let atv = der(0x30, &[der(0x06, &[0x55, 0x04, 0x03]), cn].concat()); // 2.5.4.3 = CN
+    let name = der(0x30, &der(0x31, &atv)); // SEQUENCE OF SET
+
+    // Validity：notBefore / notAfter（UTCTime）。客户端不校验有效期，
+    // 但字段本身必须存在且格式合法。
+    let validity = der(
+        0x30,
+        &[der(0x17, b"250101000000Z"), der(0x17, b"350101000000Z")].concat(),
+    );
+
+    // SubjectPublicKeyInfo：SEQUENCE { AlgorithmIdentifier, BIT STRING(pubkey) }
     let mut spki_bits = vec![0u8]; // 未使用位数
     spki_bits.extend_from_slice(ed25519_pubkey);
-    let mut spki_body = alg;
+    let mut spki_body = alg_id.clone();
     spki_body.extend_from_slice(&der(0x03, &spki_bits));
     let spki = der(0x30, &spki_body);
 
-    // tbsCertificate 的子项顺序是客户端解析器写死的：
-    //   version[0], serial, sigAlg, issuer, validity, subject, SPKI
-    // 客户端取 children[base + 5] 作为 SPKI（有 version 时 base = 1）。
+    // TBSCertificate 子项顺序有讲究：客户端按 children[base + 5] 取 SPKI，
+    // 所以顺序必须与 RFC 5280 一致。见 `aad_zeroes_the_session_id_field` 同族的用例。
     let mut tbs_body = Vec::new();
-    tbs_body.extend_from_slice(&der(0xa0, &der(0x02, &[0x00]))); // version
+    tbs_body.extend_from_slice(&der(0xa0, &der(0x02, &[0x02]))); // version = v3
     tbs_body.extend_from_slice(&der(0x02, &[0x01])); // serialNumber
-    tbs_body.extend_from_slice(&der(0x30, &[])); // signature
-    tbs_body.extend_from_slice(&der(0x30, &[])); // issuer
-    tbs_body.extend_from_slice(&der(0x30, &[])); // validity
-    tbs_body.extend_from_slice(&der(0x30, &[])); // subject
-    tbs_body.extend_from_slice(&spki);
+    tbs_body.extend_from_slice(&alg_id); // signature
+    tbs_body.extend_from_slice(&name); // issuer
+    tbs_body.extend_from_slice(&validity); // validity
+    tbs_body.extend_from_slice(&name); // subject
+    tbs_body.extend_from_slice(&spki); // subjectPublicKeyInfo
     let tbs = der(0x30, &tbs_body);
 
     let mut sig_bits = vec![0u8];
     sig_bits.extend_from_slice(&signature);
 
     let mut cert_body = tbs;
-    cert_body.extend_from_slice(&der(0x30, &[])); // 外层 signatureAlgorithm
+    cert_body.extend_from_slice(&alg_id); // 外层 signatureAlgorithm
     cert_body.extend_from_slice(&der(0x03, &sig_bits));
     der(0x30, &cert_body)
 }
@@ -384,6 +415,294 @@ fn der(tag: u8, value: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(value);
     out
+}
+
+// ───────────────────────── TLS 1.3 服务端握手 ─────────────────────────
+//
+// TLS 1.3 的握手在服务端这一侧要构造四个消息，且顺序固定：
+//   ServerHello（明文） → EncryptedExtensions → Certificate → CertificateVerify → Finished
+// 后四个一起放在**一条加密记录**里发出。
+//
+// 有个与直觉相反的细节值得写下来：**应用密钥两侧都是用「到 server Finished 为止」
+// 的 transcript 派生的**（RFC 8446 §7.1），客户端的 Finished 不参与。
+// 所以服务端发完自己的 Finished 就可以立刻派生应用密钥，不必等客户端回话。
+
+/// 服务端握手的结果。
+pub enum HandshakeOutcome {
+    /// 认证通过。后续用 `stream` 收发（已经是解密后的明文）。
+    Authenticated {
+        stream: RealityTlsStream,
+        auth: Authenticated,
+    },
+    /// 未通过认证。调用方应当把 `buffered` 以及之后读到的所有字节
+    /// **原样转发**给 `dest`，让主动探测者看到真实网站。
+    Fallback {
+        /// 已经从客户端读走、必须补发给 `dest` 的原始字节（含 TLS record 头）。
+        buffered: Vec<u8>,
+        server_name: Option<String>,
+    },
+}
+
+/// 完成一次 REALITY 服务端握手。
+pub async fn reality_server_handshake(
+    mut inner: Box<dyn Stream>,
+    cfg: &RealityServerConfig,
+) -> Result<HandshakeOutcome> {
+    // ── 1) 读第一条记录：ClientHello（明文）──
+    let record = read_record(&mut inner).await?.ok_or_else(|| {
+        TransportError::Tls("Reality server: 还没读到 ClientHello 连接就断了".into())
+    })?;
+
+    // 认证失败时要原样转发，所以先把原始字节留一份（含 5 字节 record 头）。
+    let mut buffered = record.header.to_vec();
+    buffered.extend_from_slice(&record.payload);
+
+    if record.typ != TLS_RECORD_HANDSHAKE {
+        return Ok(HandshakeOutcome::Fallback {
+            buffered,
+            server_name: None,
+        });
+    }
+
+    // 解析或认证失败都走回退，而不是报错断开 —— 报错会让探测者一眼看出这不是普通网站。
+    let ch = match parse_client_hello(&record.payload) {
+        Ok(ch) => ch,
+        Err(_) => {
+            return Ok(HandshakeOutcome::Fallback {
+                buffered,
+                server_name: None,
+            })
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| TransportError::Tls(format!("Reality server: 系统时钟早于 1970：{e}")))?
+        .as_secs();
+
+    let auth = match authenticate(&ch, cfg, now) {
+        Ok(a) => a,
+        Err(_) => {
+            return Ok(HandshakeOutcome::Fallback {
+                buffered,
+                server_name: ch.server_name.clone(),
+            })
+        }
+    };
+
+    // ── 2) 服务端临时 X25519 密钥 ──
+    let mut server_priv = rand::random::<[u8; 32]>();
+    clamp_x25519_private(&mut server_priv);
+    let server_pub = x25519_public_from_private(&server_priv);
+    let shared = x25519(&server_priv, &ch.key_share)?;
+
+    let mut server_random = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut server_random);
+
+    // ── 3) ServerHello（明文发出）──
+    let server_hello = build_server_hello(&ch.session_id, &server_random, &server_pub);
+    inner
+        .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &server_hello)?)
+        .await?;
+    inner.flush().await?;
+
+    // ── 4) 握手密钥 ──
+    let cipher = CipherSuite::try_from(TLS_AES_128_GCM_SHA256)?;
+    let mut transcript = Vec::with_capacity(4096);
+    transcript.extend_from_slice(&ch.raw);
+    transcript.extend_from_slice(&server_hello);
+    let hs = HandshakeKeys::derive(cipher, &shared, &transcript);
+    let mut server_hs = hs.server;
+    let mut client_hs = hs.client;
+
+    // ── 5) 伪造证书 + 加密飞行包 ──
+    //
+    // 每连接现生成一把 ed25519 密钥：证书的「签名域」是 HMAC 而不是真签名，
+    // 但 CertificateVerify 必须是一份**真签名**（官方客户端会验它）。
+    let signing_key = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+    let ed_pub = signing_key.verifying_key().to_bytes();
+    let cert = forge_certificate(&auth.auth_key, &ed_pub);
+
+    let mut flight = Vec::new();
+
+    let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, &[0, 0]); // 空扩展列表
+    transcript.extend_from_slice(&ee);
+    flight.extend_from_slice(&ee);
+
+    let cert_msg = build_certificate(&cert);
+    transcript.extend_from_slice(&cert_msg);
+    flight.extend_from_slice(&cert_msg);
+
+    let cv = build_certificate_verify(&signing_key, &transcript);
+    transcript.extend_from_slice(&cv);
+    flight.extend_from_slice(&cv);
+
+    let server_finished = handshake_message(
+        HS_FINISHED,
+        &finished_verify_data(&hs.server_secret, &transcript),
+    );
+    transcript.extend_from_slice(&server_finished);
+    flight.extend_from_slice(&server_finished);
+
+    inner
+        .write_all(&server_hs.seal(TLS_RECORD_HANDSHAKE, &flight)?)
+        .await?;
+    inner.flush().await?;
+
+    // ── 6) 应用密钥 ──
+    // 注意：transcript 停在 server Finished —— 两侧的 c ap / s ap traffic 都是这么派生的。
+    let app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
+
+    // ── 7) 读并校验客户端 Finished ──
+    let (typ, body) = read_encrypted_handshake(&mut inner, &mut client_hs, HS_FINISHED).await?;
+    let expected = finished_verify_data(&hs.client_secret, &transcript);
+    if expected != body {
+        return Err(TransportError::Tls(
+            "Reality server: 客户端 Finished 校验失败".into(),
+        ));
+    }
+    let _ = typ;
+
+    // 服务端读客户端、写客户端 —— 与客户端的读写密钥正好相反
+    let stream = RealityTlsStream::from_keys(inner, app.client, app.server);
+    Ok(HandshakeOutcome::Authenticated { stream, auth })
+}
+
+/// 读一条**加密的**握手消息，跳过中间的 ChangeCipherSpec。
+async fn read_encrypted_handshake(
+    inner: &mut Box<dyn Stream>,
+    key: &mut crate::reality::RecordKey,
+    expected: u8,
+) -> Result<(u8, Vec<u8>)> {
+    for _ in 0..8 {
+        let record = read_record(inner).await?.ok_or_else(|| {
+            TransportError::Tls("Reality server: 等客户端 Finished 时连接断了".into())
+        })?;
+        // TLS 1.3 允许中间盒兼容用的明文 CCS，直接跳过
+        if record.typ == TLS_RECORD_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        if record.typ != TLS_RECORD_APPLICATION_DATA {
+            return Err(TransportError::Tls(format!(
+                "Reality server: 期望加密记录，收到类型 {}",
+                record.typ
+            )));
+        }
+        let (inner_type, plaintext) = key.open(&record.header, &record.payload)?;
+        if inner_type == TLS_RECORD_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        if plaintext.len() < 4 {
+            return Err(TransportError::Tls(format!(
+                "Reality server: 解密后的握手消息过短（{} 字节，inner_type={inner_type}，record_type={}，head={:02x?}）",
+                plaintext.len(),
+                record.typ,
+                &plaintext[..plaintext.len().min(16)]
+            )));
+        }
+        let typ = plaintext[0];
+        let len = ((plaintext[1] as usize) << 16)
+            | ((plaintext[2] as usize) << 8)
+            | plaintext[3] as usize;
+        if plaintext.len() != 4 + len {
+            return Err(TransportError::Tls(
+                "Reality server: 握手消息长度与实际不符".into(),
+            ));
+        }
+        if typ != expected {
+            return Err(TransportError::Tls(format!(
+                "Reality server: 期望握手消息 {expected}，收到 {typ}"
+            )));
+        }
+        return Ok((typ, plaintext[4..].to_vec()));
+    }
+    Err(TransportError::Tls(
+        "Reality server: 连续的 CCS 记录过多".into(),
+    ))
+}
+
+/// 拼一条握手消息：`type || len24 || body`。
+fn handshake_message(typ: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.push(typ);
+    crate::reality::put_u24(body.len(), &mut out);
+    out.extend_from_slice(body);
+    out
+}
+
+/// 构造 ServerHello。
+///
+/// **`session_id` 必须原样回显客户端的** —— 客户端会拿它跟自己发出去的比对，
+/// 不一致就直接拒（REALITY 用这个字段携带认证载荷，回显是它的一部分语义）。
+fn build_server_hello(session_id: &[u8; 32], random: &[u8; 32], key_share: &[u8; 32]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(128);
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+    body.extend_from_slice(random);
+    body.push(32); // session_id 长度
+    body.extend_from_slice(session_id); // 回显
+    crate::reality::put_u16(TLS_AES_128_GCM_SHA256, &mut body);
+    body.push(0); // compression_method
+
+    let mut exts = Vec::new();
+    // supported_versions = TLS 1.3
+    push_ext(&mut exts, 43, &[0x03, 0x04]);
+    // key_share = X25519
+    let mut ks = Vec::with_capacity(36);
+    crate::reality::put_u16(GROUP_X25519, &mut ks);
+    crate::reality::put_u16(32, &mut ks);
+    ks.extend_from_slice(key_share);
+    push_ext(&mut exts, 51, &ks);
+
+    crate::reality::put_u16(exts.len() as u16, &mut body);
+    body.extend_from_slice(&exts);
+    handshake_message(HS_SERVER_HELLO, &body)
+}
+
+/// 构造 Certificate 消息（单张证书，无 OCSP、无 SCT）。
+fn build_certificate(cert_der: &[u8]) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(cert_der.len() + 8);
+    crate::reality::put_u24(cert_der.len(), &mut entry);
+    entry.extend_from_slice(cert_der);
+    crate::reality::put_u16(0, &mut entry); // 每证书的扩展列表，空
+
+    let mut list = Vec::with_capacity(entry.len() + 3);
+    crate::reality::put_u24(entry.len(), &mut list);
+    list.extend_from_slice(&entry);
+
+    let mut body = Vec::with_capacity(list.len() + 4);
+    body.push(0); // certificate_request_context 长度 = 0
+    body.extend_from_slice(&list);
+    handshake_message(HS_CERTIFICATE, &body)
+}
+
+/// 构造 CertificateVerify。
+///
+/// 签名内容按 RFC 8446 §4.4.3：
+/// `0x20 × 64 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash`。
+/// **官方客户端会验这个签名**，所以必须用真 ed25519 私钥签，不能糊弄。
+fn build_certificate_verify(signing_key: &SigningKey, transcript: &[u8]) -> Vec<u8> {
+    let transcript_hash = <sha2::Sha256 as sha2::Digest>::digest(transcript);
+
+    let mut to_sign = Vec::with_capacity(64 + 33 + 1 + 32);
+    to_sign.extend_from_slice(&[0x20u8; 64]);
+    to_sign.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    to_sign.push(0);
+    to_sign.extend_from_slice(&transcript_hash);
+
+    let signature = signing_key.sign(&to_sign).to_bytes();
+
+    let mut body = Vec::with_capacity(4 + 64);
+    crate::reality::put_u16(0x0807, &mut body); // ed25519
+    crate::reality::put_u16(signature.len() as u16, &mut body);
+    body.extend_from_slice(&signature);
+    handshake_message(HS_CERTIFICATE_VERIFY, &body)
+}
+
+/// 追加一个 TLS 扩展：`type(2) len(2) data`。
+fn push_ext(out: &mut Vec<u8>, typ: u16, data: &[u8]) {
+    crate::reality::put_u16(typ, out);
+    crate::reality::put_u16(data.len() as u16, out);
+    out.extend_from_slice(data);
 }
 
 #[cfg(test)]
@@ -674,5 +993,134 @@ mod tests {
         let auth = authenticate(&ch, &fixture_config(), 0).expect("认证");
         let cert = forge_certificate(&auth.auth_key, &[0x33u8; 32]);
         verify_reality_certificate(&cert, &auth.auth_key).expect("伪造证书必须能过客户端校验");
+    }
+
+    // ─── 自环：我们的客户端 ↔ 我们的服务端，完整 TLS 1.3 ──────────────────
+    //
+    // 这是阶段 2 的核心验证。前面那些用例只测到「认证」这一层；
+    // 这里跑的是**完整的握手**：ServerHello、密钥调度、伪造证书、
+    // CertificateVerify、双方 Finished，以及握手之后的应用数据收发。
+    //
+    // 用内存管道而不是真实 socket：协议与传输无关，而且这样测试不需要网络、
+    // 不需要线程（wasip2 上没有线程，测试写法必须与目标平台一致）。
+
+    /// 造一对匹配的服务端 / 客户端配置。
+    fn keypair_configs() -> (RealityServerConfig, RealityConfig) {
+        let mut server_priv = [0x42u8; 32];
+        clamp_x25519_private(&mut server_priv);
+        let server_pub = x25519_public_from_private(&server_priv);
+        (
+            RealityServerConfig {
+                private_key: server_priv,
+                short_ids: vec![SHORT_ID],
+                server_names: vec![SNI.to_string()],
+                max_time_diff_secs: 60,
+            },
+            RealityConfig {
+                public_key: server_pub,
+                short_id: SHORT_ID,
+                client_version: [26, 3, 27],
+            },
+        )
+    }
+
+    /// **核心用例**：我们自己的客户端与自己的服务端完成完整握手，并能双向传数据。
+    #[test]
+    fn our_client_completes_full_handshake_against_our_server() {
+        use crate::reality::reality_handshake;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xt_wasm_runtime::block_on;
+
+        let (server_cfg, client_cfg) = keypair_configs();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        // ── 握手 ──
+        let (srv, cli) = block_on(async {
+            futures::join!(
+                reality_server_handshake(Box::new(server_io), &server_cfg),
+                reality_handshake(Box::new(client_io), SNI, &[], &client_cfg),
+            )
+        });
+
+        let mut server_stream = match srv.expect("服务端握手必须成功") {
+            HandshakeOutcome::Authenticated { stream, auth } => {
+                // 服务端应当认出这是授权客户端（而不是走 dest 回退）
+                assert_eq!(auth.short_id, SHORT_ID);
+                assert_eq!(auth.client_version, [26, 3, 27]);
+                stream
+            }
+            HandshakeOutcome::Fallback { .. } => {
+                panic!("本体应当认证通过，却走了 dest 回退")
+            }
+        };
+        let mut client_stream = cli.expect("客户端握手必须成功");
+
+        // ── 应用数据双向 ──
+        //
+        // 顺序收发而不是并发：内存管道有 64KB 缓冲，这点数据写下去不会阻塞，
+        // 而并发需要同时可变借用两个流，反而绕。这里要验的是「两侧应用密钥一致」。
+        block_on(async {
+            client_stream
+                .write_all(b"ping from client")
+                .await
+                .expect("客户端写");
+            client_stream.flush().await.expect("客户端 flush");
+
+            let mut buf = [0u8; 64];
+            let n = server_stream.read(&mut buf).await.expect("服务端读");
+            assert_eq!(&buf[..n], b"ping from client", "服务端应收到客户端明文");
+
+            server_stream
+                .write_all(b"pong from server")
+                .await
+                .expect("服务端写");
+            server_stream.flush().await.expect("服务端 flush");
+
+            let n = client_stream.read(&mut buf).await.expect("客户端读");
+            assert_eq!(
+                &buf[..n],
+                b"pong from server",
+                "客户端应收到服务端明文（说明两侧应用密钥一致）"
+            );
+        });
+    }
+
+    /// 错私钥的客户端连过来时，服务端应当走 **dest 回退**而不是报错断开。
+    ///
+    /// 断开会让主动探测者一眼看出这不是普通网站；回退才是 REALITY 的正确行为。
+    #[test]
+    fn wrong_key_client_falls_back_instead_of_erroring() {
+        use crate::reality::reality_handshake;
+        use xt_wasm_runtime::block_on;
+
+        let (server_cfg, mut client_cfg) = keypair_configs();
+        // 客户端拿一个别的服务端公钥（模拟探测者 / 非授权客户端）
+        let mut other_priv = [0x99u8; 32];
+        clamp_x25519_private(&mut other_priv);
+        client_cfg.public_key = x25519_public_from_private(&other_priv);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let (srv, _cli) = block_on(async {
+            futures::join!(
+                reality_server_handshake(Box::new(server_io), &server_cfg),
+                async {
+                    // 客户端握手会失败（服务端不回 ServerHello），忽略结果
+                    let _ = reality_handshake(Box::new(client_io), SNI, &[], &client_cfg).await;
+                }
+            )
+        });
+
+        match srv.expect("服务端不应报错") {
+            HandshakeOutcome::Fallback { buffered, .. } => {
+                assert!(
+                    !buffered.is_empty(),
+                    "回退时必须把已读到的原始字节带出来，否则没法转发给 dest"
+                );
+            }
+            HandshakeOutcome::Authenticated { .. } => {
+                panic!("错私钥的客户端不该被认证通过")
+            }
+        }
     }
 }

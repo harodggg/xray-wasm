@@ -33,8 +33,8 @@ mod reality_server;
 pub use config::{ClientCert, EchOpts, RealityConfig, TlsConfig};
 pub use reality::{reality_handshake, RealityTlsLayer, RealityTlsStream};
 pub use reality_server::{
-    authenticate, forge_certificate, parse_client_hello, Authenticated, ClientHello,
-    RealityServerConfig,
+    authenticate, forge_certificate, parse_client_hello, reality_server_handshake, Authenticated,
+    ClientHello, HandshakeOutcome, RealityServerConfig,
 };
 
 /// Enable raw (unframed) passthrough in **both** directions if `stream` is a

@@ -603,3 +603,107 @@ AuthKey = HKDF-SHA256(ikm=AuthKey, salt=ClientHello.random[:20], info="REALITY")
 | 1. TLS 1.3 服务端握手 | ⬜ 未开始 |
 | 5. VLESS 服务端解码 + Vision | ⬜ 未开始 |
 | 6. `dest` 回退 | ⬜ 未开始 |
+
+---
+
+## V19 · REALITY 服务端 · 阶段 2：TLS 1.3 服务端握手（官方客户端互通成功）
+
+### 做了什么
+
+在阶段 1（认证 + 证书伪造）之上补完 TLS 1.3 **服务端**握手：
+
+```text
+ServerHello（明文，回显客户端 session_id）
+  → [EncryptedExtensions ‖ Certificate ‖ CertificateVerify ‖ Finished]（一条加密记录）
+  → 读并校验客户端 Finished
+  → 派生应用密钥
+```
+
+几个实现上的要点：
+
+* **ServerHello 必须回显客户端的 `session_id`** —— 客户端会拿它跟自己发出去的比对。
+* **应用密钥两侧都是用「到 server Finished 为止」的 transcript 派生的**（RFC 8446 §7.1），
+  客户端的 Finished 不参与。所以服务端发完自己的 Finished 就能立刻派生密钥，不必等回话。
+* 服务端的读写密钥与客户端**相反**：用 `server` 密钥写、`client` 密钥读。
+  记录层直接复用了客户端的 `RealityTlsStream`（分帧、重放保护、半关闭逻辑两侧一样）。
+* 要处理客户端可能发来的明文 **ChangeCipherSpec**（中间盒兼容），跳过它继续读。
+
+### 自环验证
+
+`our_client_completes_full_handshake_against_our_server`：
+我们自己的客户端与自己的服务端在内存管道里完成完整握手，
+并成功双向交换应用数据（证明两侧应用密钥一致）。
+
+`wrong_key_client_falls_back_instead_of_erroring`：
+错私钥的客户端连过来时服务端走 **dest 回退**（并带出已读的原始字节），
+而不是报错断开 —— 报错会让探测者一眼看出这不是普通网站。
+
+### 跨实现验证（本阶段的关键，也是踩坑的地方）
+
+用 `crates/xt-wasm-tls/examples/reality_server_probe.rs` 起一个只做握手的服务端，
+让**官方 Xray 客户端**连过来。第一次的结果是：
+
+```
+PROBE_ERR tls handshake: Reality server: 解密后的握手消息过短（2 字节，inner_type=21）
+```
+
+`inner_type=21` 是 alert，内容是 `02 2a` = fatal **bad_certificate** ——
+**官方客户端拒绝了我们的证书**，而同样的证书我们自己的客户端却接受。
+
+用 `openssl x509` 一看就清楚了：第一版为了省事，把 issuer / validity /
+signatureAlgorithm 都写成了**空 SEQUENCE**：
+
+```
+SEQUENCE (sigAlg)   ← l=0  空
+SEQUENCE (issuer)   ← l=0  空
+SEQUENCE (validity) ← l=0  空
+```
+
+我们客户端的解析器只按位置取 SPKI（`children[base+5]`），所以能过；
+而官方客户端用的是 Go 真正的 `x509.ParseCertificate`，空 Name / 空 Validity /
+空 AlgorithmIdentifier 都不是合法 DER，解析失败就退回 CA 链校验，必然失败。
+
+> **教训：能被自己解析 ≠ 是合法的编码。** 只对着自己的实现测，这类问题永远发现不了。
+
+改成完整 X.509（v3 + serial + Ed25519 AlgorithmIdentifier + CN Name +
+UTCTime 有效期 + SPKI）之后，`openssl x509` 能正常解析，
+官方客户端也接受了。**最终结果**：
+
+```
+PROBE_AUTH_OK short_id=[de, ad, be, ef, 00, 11, 22, 33] client_ver=[26, 3, 27]
+PROBE_APPDATA 512 bytes, head=00 b21e29c8a8ea40a2b953c2b04d73d775 12 0a10
+                          78746c732d727072782d766973696f6e 01 01bb 02 0b 6578616d706c65
+```
+
+那段应用数据正是官方客户端发来的 **VLESS 请求头**，逐字段可读：
+
+| 字节 | 含义 |
+|---|---|
+| `00` | VLESS 版本 |
+| `b21e29c8a8ea40a2b953c2b04d73d775` | 用户 UUID |
+| `12` / `0a 10` / `78746c732d727072782d766973696f6e` | addon：flow = **`xtls-rprx-vision`** |
+| `01` | 命令 TCP |
+| `01bb` | 端口 443 |
+| `02` `0b` `6578616d706c652e636f6d` | 地址：域名 `example.com` |
+
+也就是说官方客户端：**认可了 REALITY 认证** → **验证通过我们的 CertificateVerify
+真签名并接受了证书** → **我们的服务端成功解密了应用数据**。
+
+复现：
+
+```sh
+cargo run -p xt-wasm-tls --release --example reality_server_probe -- \
+    4042424242424242424242424242424242424242424242424242424242424242 \
+    deadbeef00112233 www.cloudflare.com 18450
+```
+
+### 阶段状态
+
+| 阶段 | 状态 |
+|---|---|
+| 4. 服务端侧 REALITY 认证解密 | ✅ 完成 |
+| 2. 每连接伪造临时 ed25519 证书 | ✅ 完成（**已修正为完整 X.509**） |
+| 3. X.509 DER 编码 | ✅ 完成 |
+| 1. TLS 1.3 服务端握手 | ✅ **完成**（本阶段，官方客户端互通通过） |
+| 5. VLESS 服务端解码 + Vision | ⬜ 未开始 |
+| 6. `dest` 回退 | ⬜ 未开始（回退**判定**已就位，转发未实现） |

@@ -14,6 +14,8 @@ aes-gcm = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 x25519-dalek = { workspace = true }
+# 服务端需要：每连接生成临时 ed25519 证书并签 CertificateVerify。
+ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 
 # 只取 tokio 的 io trait / 工具，不引入任何 runtime。

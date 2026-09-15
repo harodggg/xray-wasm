@@ -153,8 +153,8 @@ printf '  悬停增量 = %s ticks\n' "$SPIN"
 if [ "$SPIN" -gt "$MAX_TICKS" ]; then
     echo "--- 服务端日志尾部 ---" >&2
     tail -5 "$XW_DIR/.e2e-spin-server.log" >&2
-    fail "服务端在悬停状态下忙等（$SPIN ticks / ${SAMPLES}s；空闲时只有 $IDLE）—— 这就是 V24 的自旋"
+    fail "服务端在悬停状态下忙等（$SPIN ticks / ${SAMPLES}s；空闲时只有 ${IDLE}）—— 这就是 V24 的自旋"
 fi
-pass "悬停状态下 CPU 增量 = $SPIN ticks（空闲基线 $IDLE），未自旋"
+pass "悬停状态下 CPU 增量 = $SPIN ticks（空闲基线 ${IDLE}），未自旋"
 
 printf '\n  自旋回归通过。\n'

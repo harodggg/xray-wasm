@@ -1653,3 +1653,98 @@ CPU 是「一核」而不是「爆表」。
 的变体。判据不变，几十秒一次。
 
 至今**仍未修复**。
+
+### V24 十三续：一次修法尝试（**方向错了，已回滚**）与问题的完整记录
+
+#### 尝试
+
+假设：`check_write()` 不可靠地返回 0，而真正该调用的是 `output.write()` 本身 ——
+所以把 `Ok(0)` 分支改成「先直接试一次 write，真写不进再挂起」。
+
+#### 结果：**编译期就被否掉了，方向是错的**
+
+```rust
+error[E0599]: no variant named `WouldBlock` found for enum `StreamError`
+```
+
+WASI 0.2 的 `StreamError` 只有 `Closed` 和 `LastOperationFailed`，**没有 `WouldBlock`**。
+这说明 `output-stream.write` 在写不进时的语义不是「返回一个可重试的错误」，
+而 `check_write()` 正是用来**避免阻塞**在 `write` 上的。
+
+所以「绕过 `check_write` 直接写」不是修法，反而可能把一个忙等换成一个真正的阻塞。
+已回滚。
+
+---
+
+## 问题记录（把已知事实集中到这里，便于接手）
+
+### 一句话
+
+**服务端在「有过连接 + 往流上写过」之后，`check_write()` 恒为 0，写永远完不成，
+上层以约 18,000 次/秒重试，把一核吃满，且永不恢复。**
+
+### 触发条件（全部实测）
+
+| 场景 | 5 秒 CPU 增量 |
+|---|---|
+| 我们的服务端 + 快路径（300 条全部完成） | ~0 |
+| 我们的服务端 + 300 条悬停在 connect | **501** |
+| socket 层探针：只 read | 0 |
+| socket 层探针：read + `timeout(...)` | 0 |
+| socket 层探针：**写过**（只写 / 读写交替） | **501** |
+| 纯 wstd 最小复现器（accept + read / connect） | 0 |
+
+⇒ **要复现必须同时满足：① 用我们的 `NetStream`；② 往流上写过；③ 数量多。**
+
+### 直接机制（看门狗实测）
+
+```
+[WD] write_entry=18336  cw_zero=18336  wr_PENDING_on_zero=18336
+[WD] flush_entry=144    flush_wr_PENDING=144
+```
+
+`cw_zero` 与 `write_entry` **一个不差** ⇒ `check_write()` 每一次都返回 0。
+
+### 最反常、也是目前最该解释的一点
+
+探针只写 **15 字节**，客户端**从不读取**。这条路径**本不该**返回「写不进去」。
+即 `check_write()` 在一条**新建的、一个字节都没写过**的连接上就返回 0。
+
+### 已排除（6 个假设 + 2 个方向，全部实测）
+
+| 假设 | 结果 |
+|---|---|
+| `Ready` 用 `OnceLock` 永久复用 pollable | ❌ 无效 |
+| 空读 `continue` 忙等 | ❌ 无效（且有截断风险） |
+| `tokio::io::split` + `join!` 共用 task waker | ❌ 无效（该复现里 relay 根本没跑） |
+| 消费就绪后丢弃订阅 | ❌ 不可达代码 |
+| `WaitFor` Pending 后重建 | ❌ 无效 |
+| `timeout` 的 `select` 结构 | ❌ 无效 |
+| wstd / wasmtime 本身有问题 | ❌ 已证伪（纯 wstd 复现器 0 ticks） |
+| socket 层写法有问题 | ❌ 已摘除（只读时 0 ticks） |
+| 绕过 `check_write` 直接 write | ❌ 方向错（WASI 无 WouldBlock，可能阻塞） |
+
+### 最小复现（48 行，几十秒一次）
+
+```sh
+cargo build --release --example stream_spin_probe_w -p xt-wasm-runtime --target wasm32-wasip2
+wasmtime run -C cache=n -S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y \
+  target/wasm32-wasip2/release/examples/stream_spin_probe_w.wasm 12396 &
+# 再用 300 条「连上但不发数据、也不读」的连接灌它，读 /proc/<pid>/stat 的 CPU ticks
+```
+
+仓库里三个探针：`stream_spin_probe.rs`（对照，0）、`stream_spin_probe_w.rs`（自旋）、
+`stream_spin_probe_rw.rs`（自旋）。端到端回归测试：`scripts/e2e-spin-test.sh`。
+
+### 下一步该查的（按可能性排序）
+
+1. **为什么新建连接的 `check_write()` 是 0** —— 直接在探针里打印它的返回值
+   （不只是"是不是 0"），以及 `output.write()` 是否曾被调用过、写进了多少字节。
+   这是目前**唯一还没测过**的核心问题。
+2. 对比 **wstd 怎么建流**：`wstd::net::TcpStream` 用 `socket.accept()` 拿到
+   `(socket, input, output)` 后直接构造；我们也是。但 wstd 的 `poll_write`（如果有）
+   或 `AsyncOutputStream::write` 的调用方式可能与我们的 `check_write` 门控不同。
+3. 若不是 `check_write` 本身：查**为什么任务在 `Pending` 状态下被 ~18k 次/秒重轮询**
+   （这在只读探针里不发生，说明与"写过"有关的状态参与了唤醒）。
+
+**这个 bug 至今未修复。** 上面每条结论都来自实测，没有推测。

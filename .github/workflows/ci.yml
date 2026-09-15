@@ -49,45 +49,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: 格式检查
-        run: cargo fmt --all -- --check
-
-      - name: Clippy（warnings 视为错误）
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: 单元测试
-        run: cargo test --workspace
-
-      - name: 构建 wasm32-wasip2
-        run: cargo build -p xt-wasm-cli --release --target wasm32-wasip2
-
-      - name: 依赖树约束（不得引入 C++/mio）
-        run: |
-          # BoringSSL 是 C++、mio 依赖 epoll/kqueue —— 两者在 wasm 上都不可能工作。
-          # 一旦有人不小心把某条依赖链引进来，这里要立刻失败 ——
-          # 否则错误会以「wasm 构建在更晚的阶段莫名其妙地挂掉」的形式出现。
-          if cargo tree -p xt-wasm-cli --target wasm32-wasip2 \
-               | grep -iE 'boring|mio|parking_lot|socket2|openssl'; then
-            echo "::error::wasm 依赖树里出现了不该有的 C++/运行时依赖"
-            exit 1
-          fi
-          echo "依赖树干净"
-
-      - name: 生产代码不得引用 tokio runtime
-        run: |
-          # tokio 的 net/time/rt 等在 wasm 上是 compile_error! 或不可用，
-          # 只允许 io-util 的 trait 与工具。
-          #
-          # 必须排除**注释行**：文档里为了解释「为什么不能用 tokio::net」
-          # 会提到它。第一版检查没排除注释，结果 CI 红在自己的说明文字上。
-          hits=$(grep -rnE 'tokio::(net|time|spawn|runtime|fs|process|signal)' crates/*/src/ \
-                 | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
-          if [ -n "$hits" ]; then
-            echo "$hits"
-            echo "::error::生产代码里出现了 tokio runtime 调用"
-            exit 1
-          fi
-          echo "无 tokio runtime 调用"
+      # 所有静态检查都收敛到 scripts/check.sh —— 本地与 CI 跑的是同一条命令，
+      # 不会出现「本地觉得跑过了、CI 却红」这种漂移。
+      # 这里只保留「产物上传」这类 CI 专属的步骤在外。
+      - name: 跑全部检查（与本地同一条命令）
+        run: ./scripts/check.sh
 
       - name: 上传 wasm 产物
         uses: actions/upload-artifact@v4

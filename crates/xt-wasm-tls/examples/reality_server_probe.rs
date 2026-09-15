@@ -61,7 +61,9 @@ fn main() {
     };
 
     block_on(async move {
-        let listener = listen(&format!("127.0.0.1:{port}")).await.expect("监听失败");
+        let listener = listen(&format!("127.0.0.1:{port}"))
+            .await
+            .expect("监听失败");
         println!("PROBE_READY {}", listener.local_addr().expect("local_addr"));
 
         let stream = listener.accept().await.expect("accept 失败");
@@ -76,8 +78,10 @@ fn main() {
                 let mut buf = [0u8; 512];
                 match stream.read(&mut buf).await {
                     Ok(n) if n > 0 => {
-                        let head: String =
-                            buf[..n.min(48)].iter().map(|b| format!("{b:02x}")).collect();
+                        let head: String = buf[..n.min(48)]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
                         println!("PROBE_APPDATA {n} bytes, head={head}");
                     }
                     Ok(_) => println!("PROBE_APPDATA_EOF"),

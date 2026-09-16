@@ -83,7 +83,17 @@ XW_WASMTIME_ARGS="-S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y -S inh
 export XW_WASMTIME_ARGS
 
 export XW_ROOT XW_WS
-export XW_WASM="$CARGO_TARGET_DIR/wasm32-wasip2/release"
+# wasm 产物目录：优先仓库内 `target/`。
+#
+# 受限环境下 `CARGO_TARGET_DIR` 默认被指到工作区外（见「坑 1」），那个位置
+# 可能既不可写、又残留着**旧构建**的 wasm —— 于是 e2e 会静默跑旧产物，
+# 改了源码却在测旧字节（本仓库为此白排查过好几轮）。仓库内的 target/ 一定
+# 是这次构建写出来的，所以只要它在就用它。
+if [ -f "$XW_ROOT/target/wasm32-wasip2/release/xt-wasm-cli.wasm" ]; then
+    export XW_WASM="$XW_ROOT/target/wasm32-wasip2/release"
+else
+    export XW_WASM="$CARGO_TARGET_DIR/wasm32-wasip2/release"
+fi
 
 xw_info() {
     printf '  rustc        %s\n' "$(rustc --version 2>/dev/null || echo '缺失')"

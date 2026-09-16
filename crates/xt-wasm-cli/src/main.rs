@@ -33,9 +33,9 @@
 //! 顺序与 port-map §4.3 一致。VLESS 请求头用 `new_deferred`（不在此刻等服务端应答），
 //! 应答在首次读时顺带处理。
 //!
-//! **服务端不实现 Vision（flow）**：客户端必须把 `flow` 留空。请求里带了非空 flow
-//! 时服务端会明确报 `NotSupported` 而不是默默降级 —— 静默降级会变成一类
-//! 「认证过了但数据流对不上」的偶发故障。
+//! **本工程的服务端也实现了 Vision**（见 `docs/vision-server-plan.md`），所以默认
+//! 路径与官方 Xray 服务端一致。`--no-flow` 仍然保留：它是一条「两端都同意跳过
+//! Vision」的兼容开关，而不是历史遗留。
 
 mod server;
 mod socks5;
@@ -75,13 +75,12 @@ struct Args {
     handshake_timeout_secs: u64,
     /// 不发 XTLS-Vision flow 声明，也不做客户端侧 Vision 分帧。
     ///
-    /// **指向本工程的 wasm 服务端时必须开**：服务端侧的 Vision 流控尚未实现，
-    /// 请求里带非空 flow 会被明确拒绝。
+    /// 两端都实现了 Vision，所以**默认不需要它**；它用于「对端只认空 flow」的
+    /// 场景（对端配置写成 `flow: ""`，或排障时先排除 Vision）。
     ///
     /// 注意这不只是「请求头少两个字节」：Vision 的客户端侧会把**最初的负载
-    /// 包进填充帧**，而本工程的服务端不做拆帧，会把那些填充字节当成原始数据
-    /// 转发给目标站 —— 结果是「连上了但数据是坏的」。所以 `--no-flow` 必须
-    /// **同时**关掉 flow 声明和 `VisionConn` 包装。
+    /// 包进填充帧**。所以 `--no-flow` 必须**同时**关掉 flow 声明和
+    /// `VisionConn` 包装 —— 只关一半会让服务端把填充字节当成原始数据。
     no_flow: bool,
     self_test: bool,
 }
@@ -102,19 +101,19 @@ fn usage() -> ! {
                        协商阶段读超时秒数（默认 {}）。防止「连上不发数据」的连接
                        长期占住一个并发槽位。
   --no-flow            不发 XTLS-Vision flow 声明，也不做客户端侧 Vision 分帧。
-                       **服务端是本工程的 `xt-wasm-cli server` 时必须加** ——
-                       服务端侧 Vision 流控尚未实现，带 flow 的请求会被明确拒绝。
-                       指向 stock Xray 服务端时**不要**加（Vision 是它的正常路径）。
+                       **默认不需要**：本工程的服务端与 stock Xray 服务端都支持
+                       Vision。只在「对端只认空 flow」或排障时才加。
 
 环境变量（命令行参数优先，便于 k8s 用 Secret 注入而不用写进 args）：
   XT_SERVER  XT_PBK  XT_SID  XT_SNI  XT_UUID  XT_LISTEN  XT_CLIENT_VER
   XT_SOCKS_USER  XT_SOCKS_PASS  XT_HANDSHAKE_TIMEOUT  XT_NO_FLOW  XT_SELF_TEST
 
-互操作（哪一端是哪个实现，决定要不要 --no-flow）：
-  wasm 客户端 --no-flow  →  wasm 服务端         ✅
-  wasm 客户端 --no-flow  →  stock Xray 服务端   ✅（flow 为空是合法配置）
+互操作（默认走 Vision；四种组合都必须能通）：
+  wasm 客户端（默认）    →  wasm 服务端         ✅
   wasm 客户端（默认）    →  stock Xray 服务端   ✅
-  wasm 客户端（默认）    →  wasm 服务端         ❌ 被明确拒绝（服务端不实现 Vision）",
+  wasm 客户端 --no-flow  →  wasm 服务端         ✅（flow 为空是合法配置）
+  wasm 客户端 --no-flow  →  stock Xray 服务端   ✅
+  未知 flow 名           →  任一服务端         ❌ 明确拒绝，不静默降级",
         version_string(RealityConfig::DEFAULT_CLIENT_VERSION),
         DEFAULT_HANDSHAKE_TIMEOUT_SECS
     );
@@ -572,7 +571,7 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
     if !args.no_flow {
         eprintln!(
             "提示：当前发送 XTLS-Vision flow。若服务端是本工程的 xt-wasm-cli server \
-             （不实现 Vision 流控），请加 --no-flow 或设 XT_NO_FLOW=1，否则会被明确拒绝。"
+             （已实现 Vision 流控）；若对端只认空 flow，请加 --no-flow 或设 XT_NO_FLOW=1。"
         );
     }
 
@@ -882,12 +881,23 @@ mod tests {
             report.outcome
         }
 
-        // 带 flow（默认）：服务端必须**明确拒绝**，而不是把填充帧当数据转发出去
+        // 带 flow（默认）：服务端现在**支持** Vision 流控，所以会把请求头解出来、
+        // 走到连接目标那一步（目标不可达 → ConnectFailed）。
+        //
+        // 这里刻意**不**断言 Rejected：Vision 从「明确拒绝」变成「能用」是本次
+        // 改动的目的。判据是「没有把填充帧当原始数据转发出去」——所以要求
+        // 必须走到 `ConnectFailed`（说明解析是成功的），而不是 `Rejected`。
         match run(false) {
-            InboundOutcome::Rejected { reason } => {
-                assert!(reason.contains("Vision"), "拒绝原因要点明 Vision：{reason}");
+            InboundOutcome::ConnectFailed { reason } => {
+                assert!(
+                    reason.contains("127.0.0.1:1"),
+                    "应当是因为连不上目标而失败：{reason}"
+                );
             }
-            other => panic!("默认（带 Vision）时服务端应当 Rejected，实际 {other:?}"),
+            InboundOutcome::Rejected { reason } => {
+                panic!("服务端仍然拒绝了 Vision 请求，说明 Vision 流控没有生效：{reason}")
+            }
+            other => panic!("带 Vision 时应当走到连接目标那一步，实际 {other:?}"),
         }
 
         // 不带 flow：请求头里没有 flow，服务端放行，往后走才因为目标不可达而失败

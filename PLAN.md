@@ -124,9 +124,10 @@ xray-wasm/
 | `scripts/e2e-test.sh` | 我们的客户端 → stock 服务端 |
 | `scripts/e2e-server-test.sh` | stock 客户端 → 我们的服务端 |
 | `scripts/e2e-wasm-to-wasm-test.sh` | 我们的客户端 `--no-flow` → 我们的服务端（自环） |
+| `scripts/e2e-vision-test.sh` | 官方客户端 `flow=vision` → 我们的服务端（**4/4 通过**；第 2 条 HTTP 200） |
 
 **互操作矩阵**（细节见 README）：stock→wasm ✅（flow 留空）、wasm→stock ✅、
-wasm→wasm 需 `--no-flow` ✅、wasm（默认带 Vision）→wasm ❌ 明确拒绝。
+wasm（默认带 Vision）→wasm ✅、wasm `--no-flow`→wasm ✅。
 
 详见 `docs/verification-log.md` V13/V15/V21/V22。
 
@@ -134,9 +135,11 @@ wasm→wasm 需 `--no-flow` ✅、wasm（默认带 Vision）→wasm ❌ 明确�
 
 1. **TLS 指纹仍是手写形状**，未实现 uTLS 的 Chrome 伪装（见 §7 风险表）。
    功能可用，但抗 JA3/JA4 与主动探测能力弱于官方客户端。
-2. **服务端侧 XTLS-Vision 未实现**：客户端必须把 `flow` 留空，
-   带非空 flow 的请求会被**明确拒绝**（不会静默降级）。
-   这是协议部分唯一还没做的功能。
+2. ~~服务端侧 XTLS-Vision~~ —— **已完成**。官方 Xray 26.3.27 客户端带
+   `flow: "xtls-rprx-vision"` 经本服务端取 `https://example.com` 拿到 HTTP 200
+   （`scripts/e2e-vision-test.sh` 第 2 条，4/4 全绿）。
+   两个真正的根因（对端 `DIRECT` 误切写侧、`DIRECT` 帧 padding 未走完就去读内层）
+   见 `docs/vision-server-plan.md` §3.0。
 3. **未实现 XTLS-Vision 的 DIRECT splice 性能优化**（功能正确，仅性能差异）。
 4. **未做 UDP / Mux / 后量子（ML-KEM、ML-DSA-65）**，均在范围内明确排除。
 

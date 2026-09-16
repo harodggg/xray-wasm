@@ -16,14 +16,14 @@ docker run --rm -p 127.0.0.1:1080:1080 \
   -e XT_LISTEN=0.0.0.0:1080 \
   -e XT_SERVER=<服务端 ip:port> -e XT_PBK=<公钥> -e XT_SID=<shortId> \
   -e XT_SNI=<伪装域名> -e XT_UUID=<uuid> \
-  ghcr.io/harodggg/xray-wasm:v0.4.0
+  ghcr.io/harodggg/xray-wasm:v0.6.0
 
 # 服务端：REALITY 入站 → 目标站（k3s 用这个）
 docker run --rm -p 8443:8443 \
   -e XT_PRIVATE_KEY=<私钥> -e XT_SHORT_IDS=<shortId> \
   -e XT_SERVER_NAMES=<伪装域名> -e XT_DEST=<同一个域名的 host:port> \
   -e XT_USERS=<uuid> \
-  ghcr.io/harodggg/xray-wasm:v0.4.0 server
+  ghcr.io/harodggg/xray-wasm:v0.6.0 server
 ```
 
 > 验证过程与原始输出见 [`docs/verification-log.md`](docs/verification-log.md)。
@@ -71,21 +71,23 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 
 | 客户端 | 服务端 | 结果 |
 |---|---|---|
-| 官方 Xray（v2rayN / 小火箭 / `xray` 二进制） | 本工程 wasm 服务端 | ✅ 可用；**配置里 `flow` 必须留空** |
+| 官方 Xray（v2rayN / 小火箭 / `xray` 二进制） | 本工程 wasm 服务端 | ✅ **可用**（`flow: "xtls-rprx-vision"` 直接写就行；`scripts/e2e-vision-test.sh` 常态化验证） |
 | 本工程 wasm 客户端（默认，带 Vision） | 官方 Xray 服务端 | ✅ 可用（Vision 是官方服务端的正常路径） |
 | 本工程 wasm 客户端 **`--no-flow`** | 本工程 wasm 服务端 | ✅ 可用（`scripts/e2e-wasm-to-wasm-test.sh` 常态化验证） |
-| 本工程 wasm 客户端（默认，带 Vision） | 本工程 wasm 服务端 | ❌ 被**明确拒绝**（服务端不实现 Vision 流控），绝不静默降级 |
+| 本工程 wasm 客户端（默认，带 Vision） | 本工程 wasm 服务端 | ✅ 可用（两端都实现了 Vision） |
 
-> 所以**要不要 `--no-flow`，取决于服务端是谁**：指向本工程的服务端就加，
-> 指向官方 Xray 服务端就别加（加了也能用，只是放弃 Vision 的流量整形）。
+> 所以**默认不用加 `--no-flow`**：本工程的服务端与官方 Xray 服务端都支持 Vision。
+> 它只在「对端只认空 flow」或排障时才需要。
 
 **必须记住的三条硬约束**（违反任一条都会得到一个「看起来在跑但不可用」的服务端）：
 
-1. **客户端 `flow` 必须留空。** 服务端的 XTLS-Vision（服务端侧流控）**尚未实现**；
-   请求里带非空 flow 时服务端会**明确报错**，不会静默降级。
-   官方 Xray 客户端的 `users[].flow` 写 `""`；
-   本工程客户端加 `--no-flow`（或 `XT_NO_FLOW=1`）—— 它同时关掉 flow 声明**和**
-   客户端侧的 Vision 分帧，两者必须同进同退（只关一半会得到「连上了但数据是坏的」）。
+1. **`flow` 可以照官方写法填 `xtls-rprx-vision`。** 服务端的 XTLS-Vision
+   解帧 + 组帧都已打通（官方客户端经本服务端取真实网页拿到 HTTP 200，
+   见 `scripts/e2e-vision-test.sh` 与 `docs/vision-server-plan.md`）。
+   不认识的 flow 名仍会被**明确拒绝**，不会静默降级。
+   `--no-flow`（`XT_NO_FLOW=1`）保留给「对端只认空 flow」的场景 —— 它同时关掉
+   flow 声明**和**客户端侧 Vision 分帧，两者必须同进同退
+   （只关一半会得到「连上了但数据是坏的」）。
 2. **`XT_SERVER_NAMES` 与 `XT_DEST` 必须指向同一个真实站点。**
    否则认证失败时，探测者请求的 SNI 与拿到的证书域名对不上 —— 等于自曝。
 3. **节点时钟必须准。** REALITY 校验客户端时间戳，超出 `XT_MAX_TIME_DIFF`（默认 60 秒）
@@ -104,7 +106,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 | 方式 | 位置 |
 |---|---|
 | wasm 模块 | [Releases](https://github.com/harodggg/xray-wasm/releases) 里的 `xt-wasm-cli.wasm`（附 `SHA256SUMS`） |
-| 容器镜像 | `ghcr.io/harodggg/xray-wasm:v0.4.0`（amd64 / arm64，匿名可拉） |
+| 容器镜像 | `ghcr.io/harodggg/xray-wasm:v0.6.0`（amd64 / arm64，匿名可拉） |
 | 自行构建 | 见下方「从源码构建」 |
 
 k8s 部署清单与安全须知：[`deploy/k8s/`](deploy/k8s/README.md)。
@@ -168,7 +170,7 @@ xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid>
 | `--socks-user` | `XT_SOCKS_USER` | | | SOCKS5 用户名；**与 `--socks-pass` 必须同时给出** |
 | `--socks-pass` | `XT_SOCKS_PASS` | | | SOCKS5 密码 |
 | `--handshake-timeout` | `XT_HANDSHAKE_TIMEOUT` | | `15` | 协商阶段读超时（秒） |
-| `--no-flow` | `XT_NO_FLOW` | | 关 | 不发 Vision flow 声明，也不做客户端侧 Vision 分帧。**服务端是本工程的 `server` 时必须加** |
+| `--no-flow` | `XT_NO_FLOW` | | 关 | 不发 Vision flow 声明，也不做客户端侧 Vision 分帧。**默认不需要**（两端都支持 Vision） |
 | `--client-ver` | `XT_CLIENT_VER` | | `26.3.27` | REALITY 上报的 ClientVer，须落在服务端 `min/maxClientVer` 区间内 |
 | `--self-test` | `XT_SELF_TEST` | | | 只做 REALITY 握手并报告耗时，不起 SOCKS5 |
 | （无参数） | `XT_MODE=server` | | | 等价于子命令 `server`，供不方便写 args 的部署使用 |
@@ -216,7 +218,7 @@ xt-wasm-cli server --private-key <base64url> --short-ids <hex[,hex...]> \
   │
   ├─ 认证通过 → TLS 1.3 服务端握手（伪造证书，见下）→ 解 VLESS 请求头
   │     ├─ UUID 不在 users 里 → 报错断开（"认证过了" ≠ "这个用户被允许"）
-  │     ├─ flow 非空 → 明确报 Unsupported（Vision 服务端侧未实现）
+  │     ├─ flow=xtls-rprx-vision → 套 VisionServerConn（解帧 + 回程组帧）
   │     └─ 回 2 字节 VLESS 响应头 [0x00, 0x00] → 连目标 → 双向转发
   │
   └─ 认证失败 → 连 dest，把**已经读走的那段 ClientHello 原样补发**给 dest，
@@ -332,7 +334,7 @@ guest exit(42) -> rc=1
 
 | 限制 | 影响 |
 |---|---|
-| **服务端侧 XTLS-Vision 未实现** | 客户端必须把 `flow` 留空。带 flow 的请求会被明确拒绝（不是静默降级） |
+| **`e2e-test.sh`（wasm 客户端 → stock Xray 服务端）红** | 与 Vision 无关：本工程 wasm 客户端到**冷启动的** stock Xray 服务端首次 REALITY 握手会卡住（HEAD 干净 worktree 上逐字复现，见 `docs/verification-log.md` V27）。官方客户端不受影响 |
 | **只支持 VLESS TCP** | 无 UDP、无 Mux、无 `xtls-rprx-vision-udp443` |
 | **single-hop，无 uTLS 服务端指纹伪装** | 证书与握手形状按 REALITY 要求构造，但不做额外的 TLS 栈指纹伪装 |
 | **并发上限 256**（`MAX_CONCURRENT_CONNS`） | 满了会等槽位而不是丢弃连接 |
@@ -534,7 +536,7 @@ curl -sS 'https://crates.io/api/v1/crates?q=reality'   # 无第二个服务端
 
 | 限制 | 影响 | 说明 |
 |---|---|---|
-| **服务端无 XTLS-Vision** | 客户端必须 `flow: ""` | 带 flow 的请求被明确拒绝，不会静默做错 |
+| **`e2e-test.sh`（wasm 客户端 → stock Xray 服务端）红** | 与本工程的 Vision 无关 | 冷启动的 stock Xray 服务端上，本工程 wasm 客户端首次 REALITY 握手会卡住；HEAD 上逐字复现，见 `docs/verification-log.md` V27 |
 | **TLS 指纹非浏览器形状** | 功能可用，但抗 JA3/JA4 与主动探测弱于官方客户端 | 手写 ClientHello 未实现 uTLS 的 Chrome 伪装 |
 | **无 XTLS-Vision DIRECT splice** | 仅性能差异，不影响连通 | 功能路径完整 |
 | **无 UDP / Mux / 后量子** | QUIC / HTTP3 经此代理不可用 | ML-KEM、ML-DSA-65、`VlessPacketConn` 均未实现 |

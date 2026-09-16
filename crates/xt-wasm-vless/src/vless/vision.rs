@@ -27,18 +27,29 @@ use super::conn::VlessConn;
 use crate::ProxyConn;
 
 const UUID_LEN: usize = 16;
-const PADDING_HEADER_LEN: usize = UUID_LEN + 1 + 2 + 2;
-const COMMAND_PADDING_CONTINUE: u8 = 0x00;
-const COMMAND_PADDING_END: u8 = 0x01;
-const COMMAND_PADDING_DIRECT: u8 = 0x02;
-const TLS_HANDSHAKE: u8 = 0x16;
-const TLS_APPLICATION_DATA: u8 = 0x17;
-const TLS_MAJOR: u8 = 0x03;
-const TLS_CLIENT_HELLO: u8 = 0x01;
-const TLS_SERVER_HELLO: u8 = 0x02;
+/// 第一帧的头长（带 UUID）：`16 + 1 + 2 + 2`。
+pub(crate) const PADDING_HEADER_LEN: usize = UUID_LEN + 1 + 2 + 2;
+/// 后续帧的短头长：`1 + 2 + 2`。
+pub(crate) const SHORT_HEADER_LEN: usize = PADDING_HEADER_LEN - UUID_LEN;
+pub(crate) const COMMAND_PADDING_CONTINUE: u8 = 0x00;
+pub(crate) const COMMAND_PADDING_END: u8 = 0x01;
+pub(crate) const COMMAND_PADDING_DIRECT: u8 = 0x02;
+pub(crate) const TLS_HANDSHAKE: u8 = 0x16;
+pub(crate) const TLS_APPLICATION_DATA: u8 = 0x17;
+pub(crate) const TLS_MAJOR: u8 = 0x03;
+pub(crate) const TLS_CLIENT_HELLO: u8 = 0x01;
+pub(crate) const TLS_SERVER_HELLO: u8 = 0x02;
 const TLS13_SUPPORTED_VERSIONS_EXT: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const TLS13_CIPHER_SUITES: [u16; 4] = [0x1301, 0x1302, 0x1303, 0x1304];
 const TLS_FILTER_PACKETS: usize = 8;
+
+/// 组帧时单帧 content 的上限。
+///
+/// 帧头的 content/padding 长度是 **u16**，而长填充最长会把帧撑到约 1400 字节；
+/// 不分块的话超长写会让长度字段回绕，对端的解帧器直接失步。
+/// 客户端 [`VisionConn`] 与服务端 [`super::vision_server::VisionServerConn`]
+/// 用同一个常量，避免两边各自漂移。
+pub(crate) const MAX_FRAME_CONTENT: usize = 16 * 1024;
 
 enum ReadState {
     Header {
@@ -214,7 +225,7 @@ impl VisionConn {
     }
 }
 
-fn contains_tls_client_hello(buf: &[u8]) -> bool {
+pub(crate) fn contains_tls_client_hello(buf: &[u8]) -> bool {
     buf.windows(6)
         .any(|w| w[0] == TLS_HANDSHAKE && w[1] == TLS_MAJOR && w[5] == TLS_CLIENT_HELLO)
 }
@@ -273,7 +284,187 @@ impl ServerHelloFilter {
     }
 }
 
-fn find_tls_server_hello_start(buf: &[u8]) -> Option<usize> {
+/// 出站方向的 TLS 状态跟踪（服务端写侧）。
+///
+/// 服务端要看的是**目标站**发回来的 TLS：这里需要两个信息 ——
+/// 「是不是 TLS」（决定要不要长填充）与「一条记录是否恰好在这里结束」
+/// （决定在哪一帧上打终止命令）。
+///
+/// # 为什么必须按记录边界跟踪，而不是看开头几个字节
+///
+/// * 「看到 `0x17 0x03 0x03` 就是应用数据」是**错的**：TLS 1.3 把握手后半段
+///   （EncryptedExtensions/Certificate/Finished）也加密成 `0x17` 记录，
+///   与应用数据线格式完全一样（实测过：提前切裸字节会让客户端把后续帧头
+///   当成密文）。
+/// * 「一段里出现了几个记录头」也不够：TCP 段的边界与记录边界不对齐，
+///   一段里可能只有半条记录，靠它判不出「这条记录到哪儿结束」。
+///
+/// 所以这里做一个**跨读的极小状态机**：记住「下一条记录还需要多少字节」，
+/// 逐段推进。它只关心记录头（5 字节）与长度，不碰内容 —— 目标站回的是
+/// 密文，我们本来也看不懂内容。
+#[derive(Debug, Default)]
+pub(crate) struct TlsRecordTracker {
+    /// 已经确认对端在讲 TLS。
+    is_tls: bool,
+    /// 当前记录的剩余字节数；`None` 表示正等着读一个新的记录头。
+    remaining: Option<usize>,
+    /// 当前记录的头 5 字节里已经攒了几个（用于跨读拼接记录头）。
+    header: [u8; 5],
+    header_len: usize,
+    /// 当前记录的类型字节。
+    rec_type: u8,
+    /// 当前记录声明的负载长度。
+    rec_len: usize,
+    /// 当前记录的第一个负载字节（用于识别 CCS）。
+    first_payload: Option<u8>,
+    /// 当前记录是不是 ChangeCipherSpec（不是数据）。
+    is_ccs: bool,
+    /// 正在攒的 ServerHello 记录负载（用于判 TLS 1.3）。
+    server_hello: Option<Vec<u8>>,
+    /// 内层确认是 TLS 1.3（对应 upstream `TrafficState.EnableXtls`）。
+    ///
+    /// 判据与 upstream `XtlsFilterTls` 一致：ServerHello 的 cipher suite
+    /// 落在 TLS 1.3 列表里、且带 `supported_versions` 扩展。
+    /// 只有它为真才允许切 `DIRECT`（连 splice 一起切）；否则只发 `END`。
+    enable_xtls: bool,
+    /// 已经**完整读完**的记录条数。
+    pub(crate) records_done: u32,
+}
+
+impl TlsRecordTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 已经确认对端在讲 TLS。
+    pub(crate) fn is_tls(&self) -> bool {
+        self.is_tls
+    }
+
+    /// 内层确认是 TLS 1.3。
+    pub(crate) fn enable_xtls(&self) -> bool {
+        self.enable_xtls
+    }
+
+    /// 观察一段出站字节，推进记录状态机。
+    pub(crate) fn observe(&mut self, buf: &[u8]) {
+        let mut i = 0usize;
+        while i < buf.len() {
+            match self.remaining {
+                None => {
+                    // 攒记录头（5 字节）
+                    let want = 5 - self.header_len;
+                    let take = want.min(buf.len() - i);
+                    self.header[self.header_len..self.header_len + take]
+                        .copy_from_slice(&buf[i..i + take]);
+                    self.header_len += take;
+                    i += take;
+                    if self.header_len < 5 {
+                        return; // 头还没齐
+                    }
+                    let t = self.header[0];
+                    let ver = [self.header[1], self.header[2]];
+                    let len = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+                    self.header_len = 0;
+                    if ver != [TLS_MAJOR, TLS_MAJOR]
+                        || (t != TLS_HANDSHAKE && t != TLS_APPLICATION_DATA)
+                    {
+                        // 不是 TLS 记录：保持 is_tls 不变，也不再继续跟踪
+                        // （避免把随机字节当记录头）。
+                        return;
+                    }
+                    self.is_tls = true;
+                    self.rec_type = t;
+                    self.rec_len = len;
+                    // 见到 ServerHello 记录就把负载攒下来，稍后判 TLS 1.3。
+                    if t == TLS_HANDSHAKE && len + 5 >= 79 {
+                        self.server_hello = Some(Vec::with_capacity(len + 5));
+                    }
+                    self.first_payload = None;
+                    self.is_ccs = false;
+                    self.remaining = Some(len);
+                }
+                Some(0) => {
+                    // 上一条记录已经结算过：转去读下一条记录的头。
+                    self.remaining = None;
+                }
+                Some(rem) => {
+                    let take = rem.min(buf.len() - i);
+                    // 记录的第一个负载字节：用来识别 ChangeCipherSpec。
+                    if rem == self.rec_len && take > 0 {
+                        self.first_payload = Some(buf[i]);
+                    }
+                    if let Some(acc) = self.server_hello.as_mut() {
+                        if acc.len() + take <= 4096 {
+                            acc.extend_from_slice(&buf[i..i + take]);
+                        }
+                    }
+                    i += take;
+                    self.remaining = Some(rem - take);
+                    if self.remaining == Some(0) {
+                        // **负载刚好在这一段读完**：当场结算这条记录。
+                        // 拖到下一轮会漏掉「本段以记录边界结束」这个事实。
+                        self.finish_record();
+                    }
+                }
+            }
+        }
+    }
+
+    /// 结算一条刚读完的记录：判定 CCS、记录计数、以及「握手是否结束」。
+    ///
+    /// CCS 的判据是**负载**：`17 03 03` + 负载首字节 `01`（长度 1 或 32）。
+    /// 它必须在这一刻判（负载刚读完），否则判到的会是下一条记录。
+    fn finish_record(&mut self) {
+        // ServerHello 收全了：判「内层是不是 TLS 1.3」，据此决定能否切 DIRECT。
+        //
+        // 与 upstream `XtlsFilterTls` 同一套判据：
+        //   * 带 `supported_versions` 扩展（`00 2b 00 02 03 04`）；
+        //   * cipher suite 落在 TLS 1.3 列表里。
+        if let Some(hello) = self.server_hello.take() {
+            const TLS13_EXT: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+            if hello.windows(6).any(|w| w == TLS13_EXT) {
+                // `hello` 是 ServerHello 的**负载**，含 4 字节 handshake 头：
+                //   handshake_type(1) length(3) | version(2) random(32)
+                //   | session_id_len(1) session_id(0..32) | cipher(2) …
+                let sid_len = hello.get(38).copied().unwrap_or(0) as usize;
+                if let Some(b) = hello.get(39 + sid_len..41 + sid_len) {
+                    let c = u16::from_be_bytes([b[0], b[1]]);
+                    if matches!(c, 0x1301..=0x1304) {
+                        self.enable_xtls = true;
+                    }
+                }
+            }
+        }
+
+        self.is_ccs = self.rec_type == TLS_APPLICATION_DATA
+            && self.first_payload == Some(0x01)
+            && (self.rec_len == 1 || self.rec_len == 32);
+        self.records_done = self.records_done.saturating_add(1);
+        // 保持 `Some(0)`：它表示「上一条记录刚好读完」，也就是当前正好
+        // 停在记录边界上（`ends_on_record_boundary`）。下一轮循环会把它
+        // 当成 `Some(0)` 再结算一次 —— 因此结算逻辑必须是幂等的。
+        self.remaining = Some(0);
+    }
+
+    /// 这一段是不是**恰好以一条完整记录结束**。
+    ///
+    /// 注意：写侧的终止判据用的是更严格的
+    /// [`is_complete_application_records`]（整段全由完整 `0x17` 记录组成），
+    /// 这个较松的判定只用于诊断与测试。
+    #[allow(dead_code)]
+    pub(crate) fn ends_on_record_boundary(&self) -> bool {
+        self.is_tls && self.remaining == Some(0) && self.header_len == 0
+    }
+
+    /// 当前记录的类型（诊断用）。
+    #[allow(dead_code)]
+    pub(crate) fn current_type(&self) -> u8 {
+        self.rec_type
+    }
+}
+
+pub(crate) fn find_tls_server_hello_start(buf: &[u8]) -> Option<usize> {
     buf.windows(6).position(|w| {
         w[0] == TLS_HANDSHAKE && w[1] == TLS_MAJOR && w[2] == TLS_MAJOR && w[5] == TLS_SERVER_HELLO
     })
@@ -309,7 +500,7 @@ fn build_padding_frame(
     let header_len = if user_uuid.is_some() {
         PADDING_HEADER_LEN
     } else {
-        PADDING_HEADER_LEN - UUID_LEN
+        SHORT_HEADER_LEN
     };
     let mut frame = Vec::with_capacity(header_len + content.len() + padding_len);
     if let Some(uuid) = user_uuid {
@@ -388,6 +579,7 @@ impl AsyncRead for VisionConn {
                     } else {
                         0
                     };
+
                     let command = h[offset];
                     let content_len = u16::from_be_bytes([h[offset + 1], h[offset + 2]]) as usize;
                     let padding_len = u16::from_be_bytes([h[offset + 3], h[offset + 4]]) as usize;
@@ -518,7 +710,7 @@ impl AsyncRead for VisionConn {
 
                     self.read_state = match command {
                         COMMAND_PADDING_CONTINUE => ReadState::Header {
-                            buf: Vec::with_capacity(PADDING_HEADER_LEN - UUID_LEN),
+                            buf: Vec::with_capacity(SHORT_HEADER_LEN),
                             need_uuid: false,
                         },
                         COMMAND_PADDING_END => ReadState::Through,
@@ -552,12 +744,15 @@ impl AsyncWrite for VisionConn {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if let Poll::Ready(done) = this.drain_pending_write(cx) {
-            if let Some(n) = done? {
-                return Poll::Ready(Ok(n));
-            }
-        } else {
-            return Poll::Pending;
+        // 先把在途帧推完。**推完要继续往下给 `buf` 组帧**，不能把
+        // `Some(consumed)` 直接返回：那个数字是**上一个 buf** 的写入量，
+        // 调用方（`write_all` / `tokio::io::copy`）会据此跳过 `buf` 开头
+        // 同样多的字节 —— 直接丢数据。`RealityTlsStream::poll_write` 里
+        // 对同一件事有更详细的注释。
+        match this.drain_pending_write(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(_)) => {} // 排空（或本来就没有）→ 继续组帧
         }
 
         if buf.is_empty() {
@@ -569,7 +764,7 @@ impl AsyncWrite for VisionConn {
         // The padding frame carries u16 content/padding length fields:
         // chunk large writes so those fields cannot wrap and
         // desynchronise the peer's vision decoder.
-        let chunk_len = buf.len().min(16 * 1024);
+        let chunk_len = buf.len().min(MAX_FRAME_CONTENT);
         this.build_write_frame(&buf[..chunk_len]);
         match this.drain_pending_write(cx) {
             Poll::Ready(Ok(Some(n))) => Poll::Ready(Ok(n)),
@@ -585,6 +780,16 @@ impl AsyncWrite for VisionConn {
         } else {
             return Poll::Pending;
         }
+        // **顺序很关键**：必须先把待发的 Vision 帧写完，再去 flush 内层。
+        //
+        // `VlessConn` 的 `poll_flush` 会先把「延迟的 VLESS 请求头」当成裸字节
+        // 写出去。如果这里先 flush 内层，请求头就会先落到线上，随后才是
+        // Vision 帧 —— 于是**首帧没有 UUID 前缀**，对端（服务端）按
+        // upstream 的规则要求首帧以用户 UUID 开头，会直接判为「UUID 不符」。
+        //
+        // 反过来先 drain，请求头就会被 `VlessConn::poll_write_deferred`
+        // 拼到帧前面一起发出去（upstream 也是把请求头放进第一个 Vision
+        // 记录里的）。
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 

@@ -8,10 +8,10 @@
 
 ```sh
 # 客户端（默认，无子命令）：本地 SOCKS5 → REALITY 隧道
-docker run --rm -e XT_SERVER=… -e XT_PBK=… ghcr.io/harodggg/xray-wasm:v0.4.0
+docker run --rm -e XT_SERVER=… -e XT_PBK=… ghcr.io/harodggg/xray-wasm:v0.6.0
 
 # 服务端（`server` 子命令）：REALITY 入站 → 目标站
-docker run --rm -e XT_PRIVATE_KEY=… ghcr.io/harodggg/xray-wasm:v0.4.0 server
+docker run --rm -e XT_PRIVATE_KEY=… ghcr.io/harodggg/xray-wasm:v0.6.0 server
 ```
 
 子命令写在**镜像名之后**（k8s 里就是 `args: ["server"]`）：镜像 ENTRYPOINT 是 exec
@@ -123,9 +123,10 @@ k3s 自带 **ServiceLB（Klipper）**：`type: LoadBalancer` 不需要任何 clo
   "protocol": "vless",
   "settings": { "vnext": [{
     "address": "<节点IP>", "port": 8443,
-    "users": [{ "id": "<UUID>", "encryption": "none", "flow": "" }]
-    //                                                        ^^^^^^^^
-    //  必须留空：服务端侧 XTLS-Vision 尚未实现，带 flow 会被明确拒绝
+    "users": [{ "id": "<UUID>", "encryption": "none", "flow": "xtls-rprx-vision" }]
+    //                                                        ^^^^^^^^^^^^^^^^^^^
+    //  服务端已实现 XTLS-Vision（解帧 + 组帧），照官方写法填即可。
+    //  留空也支持（裸路径）；不认识的 flow 名会被明确拒绝，不静默降级。
   }]},
   "streamSettings": {
     "network": "tcp", "security": "reality",
@@ -234,21 +235,26 @@ wasip2 没有线程。实现是**单线程协作式并发**：主循环只 accep
   但**新建连接**仍会一直等到 TCP 超时，建议 `XT_SERVER` 指向稳定可达的地址。
 * 空闲时进程阻塞在 pollable 上，CPU 占用接近零（实测 30 秒空闲约 0.05%）。
 
-### 2. 服务端未实现 XTLS-Vision
-
-客户端必须把 `flow` 留空。带非空 flow 的请求会被**明确拒绝**（报
-`NotSupported`），不会静默降级 —— 静默降级会把 Vision 的填充帧当成原始数据
-发给目标站，输出是错的却不报错，属于最难排查的那类故障。
-
-### 3. TLS 指纹不是浏览器形状
+### 2. TLS 指纹不是浏览器形状
 
 手写 ClientHello 未实现 uTLS 的 Chrome 伪装。功能可用，但抗 JA3/JA4
 与主动探测的能力弱于官方客户端。见根目录 README 的「已知限制」。
 
-### 4. 不支持 UDP
+### 3. 不支持 UDP
 
 只有 TCP（客户端侧是 SOCKS5 CONNECT；服务端侧是 VLESS TCP）。
 UDP ASSOCIATE 未实现，因此 QUIC / HTTP3 经此代理不可用。
+
+---
+
+## 已经不是限制的（曾经是）
+
+* **服务端 XTLS-Vision（v0.6.0 起已实现）。** 解帧 + 组帧都通了：官方客户端带
+  `flow: "xtls-rprx-vision"` 经本服务端取真实网页拿到 HTTP 200
+  （`scripts/e2e-vision-test.sh` 常态化验证）。空 flow 的裸路径同样支持。
+  **不认识的 flow 名仍会被明确拒绝**，不会静默降级 —— 静默降级会把 Vision 的
+  填充帧当成原始数据发给目标站，输出是错的却不报错，属于最难排查的那类故障。
+* **`--no-flow` 不再是必需。** 它保留给「对端只认空 flow」的场景。
 
 ---
 

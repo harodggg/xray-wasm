@@ -25,7 +25,11 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::header::{Cmd, VlessAddr};
+use super::vision_server::VisionServerConn;
 use crate::{MeowError, Result};
+
+/// XTLS-Vision 的 flow 名称（与官方 Xray 逐字节一致）。
+pub const VISION_FLOW: &str = "xtls-rprx-vision";
 
 const ADDR_IPV4: u8 = 0x01;
 const ADDR_DOMAIN: u8 = 0x02;
@@ -218,6 +222,11 @@ pub struct InboundReport {
     pub short_id: Option<[u8; 8]>,
     /// VLESS 请求里的目标 `host:port`。解出请求头才有。
     pub target: Option<String>,
+    /// 这条连接是否走了 **XTLS-Vision** 流控。
+    ///
+    /// 单独一个字段而不是塞进 `outcome`：Vision 是「连接用的哪条数据路径」，
+    /// 与「结局」正交 —— `Forwarded` 既可能是裸流也可能是 Vision。
+    pub vision: bool,
     /// 客户端 → 目标 的字节数。
     pub up_bytes: u64,
     /// 目标 → 客户端 的字节数。
@@ -233,6 +242,7 @@ impl InboundReport {
             client_version: None,
             short_id: None,
             target: None,
+            vision: false,
             up_bytes: 0,
             down_bytes: 0,
         }
@@ -341,6 +351,7 @@ where
                 client_version: Some(auth.client_version),
                 short_id: Some(auth.short_id),
                 target: None,
+                vision: false,
                 up_bytes: 0,
                 down_bytes: 0,
             };
@@ -409,24 +420,26 @@ where
                 });
             }
 
-            // 客户端请求了 Vision 流控，但服务端侧还没实现。
-            // **必须在这里明确拒绝，不能装作没看见** —— Vision 会把负载包进填充帧，
-            // 不拆帧就会把这些字节当成原始数据发给目标站，输出是错的却不报错，
-            // 属于最难排查的那类故障。
-            if let Some(flow) = req.flow.as_deref() {
-                if !flow.is_empty() {
+            // 客户端声明的 flow 决定这条连接走哪条数据路径：
+            //   * 空 → 裸路径；
+            //   * `xtls-rprx-vision` → 套一层 `VisionServerConn`（解帧 + 组帧）；
+            //   * 其它 → **仍然明确拒绝**，绝不静默降级。
+            let vision = match req.flow.as_deref() {
+                None | Some("") => false,
+                Some(VISION_FLOW) => true,
+                Some(flow) => {
                     return Ok(InboundReport {
                         outcome: InboundOutcome::Rejected {
                             reason: format!(
-                                "服务端尚未实现 Vision 流控（客户端请求了 flow={flow}）；\
-                                 请在客户端把 flow 置空（官方 Xray 写 flow:\"\"），\
-                                 或改用本工程客户端并加 --no-flow"
+                                "未知的 flow「{flow}」——服务端只支持空 flow 与「{VISION_FLOW}」；\
+                                 请在客户端把 flow 改成空或 {VISION_FLOW}"
                             ),
                         },
                         ..base
                     });
                 }
-            }
+            };
+            let base = InboundReport { vision, ..base };
 
             // ── 解析与连接分开 ──
             // 这两步的排查方向完全不同：解析失败是 DNS/域名问题，
@@ -460,13 +473,25 @@ where
                 }
             };
 
+            // ── VLESS 响应头必须在**套 Vision 之前**裸写 ──
+            //
+            // 客户端读侧的顺序是：先用 `DecodeResponseHeader` 裸读**裸的**
+            // 响应头，再 `DecodeBodyAddons`（`NewVisionReader`）解后续的
+            // Vision 帧。所以响应头本身**不是**帧的一部分。
+            //
             // **必须回一条 VLESS 响应头**：`[version=0][addon_len=0]`。
             // 客户端连接建立后会先读这两个字节再读负载；不发的话它会把负载的
-            // 第一个字节当成版本号。这个细节是集成测试抓出来的
-            // （症状是 `version mismatch: expected 0x00, got 0x68`，0x68 正是
-            // 负载首字符 'h'）。
-            stream.write_all(&[0x00, 0x00]).await?;
-            stream.flush().await?;
+            // 第一个字节当成版本号（症状 `version mismatch: expected 0x00,
+            // got 0x68`，0x68 正是 'h'）。
+            let mut raw: Box<dyn Stream> = Box::new(stream);
+            raw.write_all(&[0x00, 0x00]).await?;
+            raw.flush().await?;
+
+            // ── 套上 Vision 解帧/组帧器（只作用于**后续的负载**）──
+            let mut stream: Box<dyn Stream> = raw;
+            if vision {
+                stream = Box::new(VisionServerConn::new(stream, req.user_id));
+            }
 
             let stats = relay_bidirectional(Box::new(stream), Box::new(outbound)).await?;
             Ok(InboundReport {
@@ -493,6 +518,8 @@ where
                 client_version: None,
                 short_id: None,
                 target: Some(cfg.dest.clone()),
+                // 回退路径永远不是 Vision：我们连它是不是 VLESS 都不知道。
+                vision: false,
                 up_bytes: 0,
                 down_bytes: 0,
             };
@@ -659,7 +686,7 @@ mod tests {
                 let tls = reality_handshake(Box::new(client_io), SNI, &[], &client_cfg)
                     .await
                     .expect("客户端握手");
-                // flow 置空：服务端尚未实现 Vision（见 serve_inbound 里的守卫）
+                // 这条用例只关心裸路径的字节搬运，所以 flow 置空
                 let mut vless = VlessConn::new_deferred(
                     Box::new(tls),
                     &uuid,
@@ -1016,9 +1043,65 @@ mod tests {
         assert_eq!(report.client_version, Some([26, 3, 27]));
     }
 
-    /// 请求了 Vision 流控时必须明确报错，而不是把填充帧当成原始数据发出去。
+    /// **Vision flow 必须被接受**，并如实回报到 `InboundReport::vision`。
+    ///
+    /// 这条用例守着「服务端支持 XTLS-Vision」这个能力本身：带
+    /// `xtls-rprx-vision` 的请求必须走到**连接目标**这一步，而不是在解析
+    /// 阶段被 `Rejected`。这里 dest 指向一个没人听的端口，所以结局是
+    /// `ConnectFailed` —— 关键是它**不再**因为 flow 被拒。
+    ///
+    /// 同时断言 `report.vision == true`：日志里要能一眼看出这条连接走的是
+    /// Vision 数据路径（解帧/组帧），而不是和裸路径混在一起。
     #[test]
-    fn inbound_rejects_vision_flow_instead_of_misreading_bytes() {
+    fn inbound_accepts_vision_flow_and_reports_it() {
+        let (report, _) =
+            run_inbound_with_flow(Some(crate::vless::server::VISION_FLOW), "xtls-rprx-vision");
+
+        assert!(
+            report.vision,
+            "带 {VISION_FLOW} 的连接必须被标记为 Vision：{report:?}"
+        );
+        assert!(
+            !matches!(report.outcome, InboundOutcome::Rejected { .. }),
+            "Vision 已经实现，不能再因为 flow 拒绝：{:?}",
+            report.outcome
+        );
+        // dest 是没人听的端口 → 必须走到「连目标」这一步才算真的接受了 flow。
+        assert!(
+            matches!(report.outcome, InboundOutcome::ConnectFailed { .. }),
+            "应当走到连接目标并失败，实际 {:?}",
+            report.outcome
+        );
+    }
+
+    /// **未知 flow 仍然必须明确拒绝**，绝不静默降级成裸路径。
+    ///
+    /// 静默降级比报错危险得多：客户端以为在打 Vision 帧、服务端按裸字节解，
+    /// 得到的是「看似合法的垃圾」。所以白名单之外一律拒绝，并告诉客户端
+    /// 怎么改。
+    #[test]
+    fn inbound_rejects_unknown_flow_with_actionable_hint() {
+        let (report, _) = run_inbound_with_flow(Some("xtls-rprx-vision-v2"), "未知 flow");
+
+        let InboundOutcome::Rejected { reason } = &report.outcome else {
+            panic!("未知 flow 必须被拒，实际 {:?}", report.outcome);
+        };
+        assert!(
+            reason.contains("xtls-rprx-vision-v2"),
+            "拒绝原因要点出是哪个 flow：{reason}"
+        );
+        assert!(
+            reason.contains(VISION_FLOW),
+            "拒绝原因要给出正确的替代值：{reason}"
+        );
+        assert!(!report.vision, "被拒的连接不该标记成 Vision：{report:?}");
+    }
+
+    /// 跑一条完整的「REALITY 握手 → VLESS 请求（指定 flow）」入站。
+    ///
+    /// 返回 `(InboundReport, ())`。三个人工构造的用例（接受 Vision、拒绝
+    /// 未知 flow）共用这套脚手架，避免三份几乎一样的握手代码各自漂移。
+    fn run_inbound_with_flow(flow: Option<&str>, _label: &str) -> (InboundReport, ()) {
         use crate::vless::{Cmd, VlessAddr, VlessConn};
         use xt_wasm_runtime::block_on;
         use xt_wasm_tls::{reality_handshake, RealityConfig, RealityServerConfig};
@@ -1037,6 +1120,7 @@ mod tests {
                 server_names: vec![SNI.to_string()],
                 max_time_diff_secs: 60,
             },
+            // 没人听的端口：任何 flow 都会走到「连接目标」并失败。
             dest: "127.0.0.1:9".to_string(),
             users: vec![uuid],
         };
@@ -1047,7 +1131,8 @@ mod tests {
         };
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (outcome, ()) = block_on(async {
+        let flow_owned = flow.map(|f| f.to_string());
+        let (report, ()) = block_on(async {
             futures::join!(serve_inbound(Box::new(server_io), &inbound), async {
                 let tls = reality_handshake(Box::new(client_io), SNI, &[], &client_cfg)
                     .await
@@ -1055,33 +1140,23 @@ mod tests {
                 if let Ok(mut vless) = VlessConn::new_deferred(
                     Box::new(tls),
                     &uuid,
-                    Some("xtls-rprx-vision"),
+                    flow_owned.as_deref(),
                     Cmd::Tcp,
                     80,
                     &VlessAddr::Ipv4([127, 0, 0, 1]),
                 )
                 .await
                 {
-                    // 同上：触发延迟写的请求头
+                    // 触发延迟写的请求头
                     let _ = vless.write_all(b"x").await;
                     let _ = vless.flush().await;
                 }
             })
         });
-
-        let report = outcome.expect("请求 Vision 应当被正常判定为 Rejected，而不是 Err");
-        let InboundOutcome::Rejected { reason } = &report.outcome else {
-            panic!("请求 Vision 必须被拒，实际 {:?}", report.outcome);
-        };
-        assert!(
-            reason.contains("Vision"),
-            "要点明是 Vision 的问题：{reason}"
-        );
-        // 关键：**必须给出客户端怎么改**，不能只说「不支持」。
-        assert!(
-            reason.contains("flow") && reason.contains("--no-flow"),
-            "拒绝原因应当告诉客户端怎么改（置空 flow / 用 --no-flow）：{reason}"
-        );
+        (
+            report.expect("入站不该报 Err（flow 的判定必须是一个 outcome）"),
+            (),
+        )
     }
 
     /// **回退路径**：未授权客户端必须被**原样转发**到 dest，而不是被断开。

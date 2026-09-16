@@ -148,21 +148,28 @@ pub fn encode_request(
     }
 }
 
-/// Append the flow addon block (length byte + protobuf blob, if any).
+/// 把 flow 写进 addon（protobuf `field 1, wire type 2`）。
 ///
-/// NOT prost — two hardcoded bytes + string copy (spec §Addon encoding).
+/// NOT prost —— 手写两个控制字节 + 字符串拷贝。
+///
+/// 这里对 flow 长度**不做假设**。早先的实现只认 `"xtls-rprx-vision"` 这一个
+/// 字符串，其它值静默当成「没有 flow」；而且它把 `addon_length` 写成 18
+/// （正确值是 `2 + len` 字节），于是 addon 块与协议约定不一致 ——
+/// 服务端的解析器会把 `addon[18]`（其实是请求的 `cmd` 字节）当成 flow 的最后
+/// 一个字节，**flow 判空因此永远不可靠**。
+///
+/// 现在按声明原样发；接不接受由服务端判断（服务端会明确拒绝未知 flow）。
 fn put_flow_addon(dst: &mut BytesMut, flow: Option<&str>) {
-    match flow {
-        Some("xtls-rprx-vision") => {
-            dst.put_u8(18); // addon_length = 18
-            dst.put_u8(0x0A); // protobuf field 1, wire type 2
-            dst.put_u8(0x10); // varint 16  (len("xtls-rprx-vision") = 16)
-            dst.put_slice(b"xtls-rprx-vision");
-        }
-        _ => {
-            dst.put_u8(0x00); // addon_length = 0
-        }
-    }
+    let Some(flow) = flow.filter(|f| !f.is_empty()) else {
+        dst.put_u8(0x00); // addon_length = 0
+        return;
+    };
+    // addon = 0x0A <len> <flow>；addon_length 是「写进 addon 的字节数」。
+    let n = flow.len();
+    dst.put_u8((2 + n) as u8);
+    dst.put_u8(0x0A); // protobuf field 1, wire type 2
+    dst.put_u8(n as u8); // varint 长度
+    dst.put_slice(flow.as_bytes());
 }
 
 // NOTE: upstream's `encode_mux_request` (behind the `mux` feature) is out of

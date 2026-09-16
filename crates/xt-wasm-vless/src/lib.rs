@@ -150,5 +150,5 @@ pub mod vless;
 pub use vless::{
     addr_from_metadata, decode_request, serve_inbound, serve_inbound_with_events, Cmd,
     InboundConfig, InboundEvent, InboundOutcome, InboundReport, Request as VlessRequest,
-    VisionConn, VlessAddr, VlessConn,
+    VisionConn, VisionServerConn, VlessAddr, VlessConn,
 };

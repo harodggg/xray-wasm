@@ -10,16 +10,16 @@
 #   e2e-wasm-to-wasm-test.sh wasm 客户端 → wasm 服务端   ← 本文件
 #
 # 前两道各自只覆盖了一半，两端都是自己的组合此前**从来没跑过**。
-# 它第一次跑就会暴露一个真问题：客户端默认发 XTLS-Vision flow，
-# 而服务端侧 Vision 流控尚未实现 —— 于是 wasm↔wasm 100% 失败。
-# 修法是客户端 `--no-flow`（或 `XT_NO_FLOW=1`）。
+# 它第一次跑时暴露过一个真问题：客户端默认发 XTLS-Vision flow，
+# 而当时服务端侧 Vision 还没实现 —— wasm↔wasm 100% 失败。
+# 现在服务端的 Vision 解帧 + 组帧都已打通，所以**默认（带 Vision）也必须连通**。
 #
 # 五步：
 #   1. 起 wasm 服务端
 #   2. 正向：`--no-flow` 的 wasm 客户端 → HTTP 200
 #   3. 同一条正向，改用环境变量 `XT_NO_FLOW=1`（交付契约里冻结的是这个变量名）
-#   4. **反向**：默认（带 Vision）的客户端必须失败，且服务端日志出现
-#      「尚未实现 Vision 流控」—— 断言这条字符串，防止将来退化成静默降级
+#   4. **反向**：默认（带 Vision）的客户端 → **也必须 HTTP 200**，
+#      且服务端日志不得出现 `outcome=Rejected`
 #   5. 配置自检 `XT_CHECK=1`：正常退出 0；把 XT_USERS 清空退出 2
 set -eu
 
@@ -208,7 +208,7 @@ CODE=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' \
 }
 pass "XT_NO_FLOW=1 → $CODE"
 
-echo "==> 4/5 反向：默认（带 Vision）的客户端**必须失败**，且服务端点名 Vision"
+echo "==> 4/5 反向：默认（带 Vision）的客户端 —— 也必须连通"
 kill "$CLI_PID" 2>/dev/null || true
 wait "$CLI_PID" 2>/dev/null || true
 CLI_PID=''
@@ -216,23 +216,25 @@ sleep 1
 cli_env bad "$XW_DIR/scripts/run-local.sh" >"$XW_DIR/.e2e-w2w-cli-bad.log" 2>&1 &
 CLI_PID=$!
 sleep 3
-# 服务端会在 VLESS 请求头里读到非空 flow 并拒绝，连接随即被关掉。
-# 用 -m 兜底，避免万一退化成「不回也不关」时把测试挂死。
-if curl -sS -m 12 -o /dev/null --proxy "socks5h://$SOCKS_BAD" "https://$TARGET/" 2>/dev/null; then
+# 服务端**支持** Vision（解帧 + 组帧都已打通），所以这条连接必须真的连通：
+# 既不能是 `Rejected`，也不能「连上了但拿不到页面」。
+CODE=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' \
+    --proxy "socks5h://$SOCKS_BAD" "https://$TARGET/" 2>/dev/null) || CODE=000
+# **双侧判据**：客户端拿到 200，且服务端把它记成一条正常的 Vision 连接。
+if grep -q "outcome=Rejected" "$XW_DIR/.e2e-w2w-srv.log"; then
     srv_log >&2
-    fail "带 Vision 的客户端竟然连上了 —— 说明服务端要么静默降级、要么根本没检查 flow"
+    fail "服务端拒绝了 Vision 请求 —— 带 flow 的请求不该再被拒"
 fi
-grep -q "outcome=Rejected" "$XW_DIR/.e2e-w2w-srv.log" || {
+[ "$CODE" = "200" ] || {
+    cat "$XW_DIR/.e2e-w2w-cli-bad.log" >&2
     srv_log >&2
-    fail "服务端没有把这条连接记成 outcome=Rejected"
+    fail "带 Vision 的自环期望 HTTP 200，实际 ${CODE}（服务端 Vision 组帧回归了？）"
 }
-# **这条字符串断言是刻意的**：服务端不实现 Vision 是已知限制，
-# 但「明确拒绝」是设计约束。将来若有人把它改成静默降级，这里必须红。
-grep -q "尚未实现 Vision 流控" "$XW_DIR/.e2e-w2w-srv.log" || {
+grep -qE "outcome=Forwarded" "$XW_DIR/.e2e-w2w-srv.log" || {
     srv_log >&2
-    fail "服务端日志里没有「尚未实现 Vision 流控」—— 拒绝原因丢了，或退化成了静默失败"
+    fail "服务端没有把这条 Vision 连接记成 Forwarded"
 }
-pass "带 Vision 被明确拒绝（outcome=Rejected，且原因点名 Vision）"
+pass "带 Vision 的自环 -> 200，且服务端记为 Forwarded" 
 
 echo "==> 5/5 配置自检 XT_CHECK=1"
 # 正常一套配置：退出码必须是 0，且**不能**真的去监听

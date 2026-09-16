@@ -11,6 +11,7 @@ pub mod conn;
 pub mod header;
 pub mod server;
 pub mod vision;
+pub mod vision_server;
 
 pub use conn::VlessConn;
 pub use header::{addr_from_metadata, Cmd, VlessAddr};
@@ -19,3 +20,4 @@ pub use server::{
     InboundOutcome, InboundReport, Request,
 };
 pub use vision::VisionConn;
+pub use vision_server::VisionServerConn;

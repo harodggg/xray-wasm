@@ -2092,3 +2092,219 @@ V24 十六/十七续我报告「`blocking_write_and_flush` 修复有效，两个
 > 忙等，凭什么会留出时间给定时器？
 
 `REQUEST_TIMEOUT` 的改动**已回滚**（它不生效，且未被验证）。
+
+---
+
+## V25 · 服务端 XTLS-Vision：读侧打通，回程仍未通过
+
+**目标**：实现 `docs/vision-server-plan.md` 里那一项「协议部分唯一还没做的功能」。
+
+### 结果
+
+* **读侧通了**：官方 Xray 26.3.27 客户端带 `flow: "xtls-rprx-vision"` 连上来后，
+  服务端解出内层 TLS ClientHello（321 字节，`16 03 01 01 3c 01 00 ...`）并
+  原样转发到 `example.com:443`。
+* **回程仍未通过**：服务端把目标的 `ServerHello` 等字节写出去了
+  （日志 `up=585 down=4871`，两个方向都在搬数据），但官方客户端握手不完成、
+  `curl` 拿 000。`scripts/e2e-vision-test.sh` 第 2 条用例**保持红色**。
+
+### 过程中修掉的真 bug（都是必修，不是猜测）
+
+1. **响应头被包进了 Vision 帧**。客户端 `getResponse` 先**裸读** 2 字节响应头
+   （`DecodeResponseHeader(conn, ...)`），之后才 `DecodeBodyAddons` 套 `VisionReader`。
+   我们把流先套上 `VisionServerConn` 再写响应头，客户端于是把帧头的 UUID 当版本号。
+   已改成**先裸写响应头、再套 Vision**。
+   （原始误判来自 upstream 服务端的 `EncodeBodyAddons(bufferWriter, ...)`：
+   `buf.NewBufferedWriter` 在 `SetFlushNext()` 后的第一次 `WriteMultiBuffer`
+   其实**走 `w.writer` 裸写**，所以响应头是裸的。）
+2. **客户端 `VisionConn::poll_flush` 顺序错**：先 flush 内层，导致 `VlessConn`
+   把延迟的 VLESS 请求头当裸字节发出，**首帧丢 UUID**。改成先 drain 待发帧。
+3. **VLESS flow addon 长度写错**：`addon_length` 写成 18（正确值 `2+len`），
+   服务端按该长度切片会把请求的 `cmd` 字节当成 flow 的最后一字节。
+4. **`poll_write` 违反 `Pending` 契约**：在途帧未写完就返回 `Pending`，
+   调用方重递同一个 `buf`，同一内容被编成两个帧。
+5. **`poll_flush` 覆盖在途帧**：已有在途帧时又组了一次帧。
+6. **测试脚手架**：受限环境下 `CARGO_TARGET_DIR` 指向工作区外、不可写，
+   e2e 会**静默**跑陈旧 wasm（改了源码却测旧字节，白排查好几轮）。
+   `scripts/env.sh` 现在优先用仓库内 `target/` 的产物。
+
+### 已排除的回程写法（都实测拿不到 200）
+
+首帧 `END` + 裸字节 / 首帧 `CONTINUE` + 握手期持续组帧 / 按记录数预算
+（1、2、3、4）切 `END` / 响应头与该段负载合并进同一帧。
+
+### 判据
+
+| 检查 | 结果 |
+|---|---|
+| `./scripts/check.sh` | ✅ 9/9 |
+| `cargo test --workspace` | ✅ 全绿（`vision_server` 14 条新单测） |
+| `e2e-server-test.sh` / `e2e-wasm-to-wasm-test.sh` | ✅ 未回归 |
+| `e2e-vision-test.sh` 第 2 条（flow=vision） | ❌ **仍然红**，不掩盖 |
+| `e2e-test.sh` | ⚠️ 当时写成 ✅，**实际未验证**（V27 更正） |
+
+### 下一步
+
+逐行对照 upstream `VisionWriter.WriteMultiBuffer`，重点核对终止命令
+（`CommandPaddingEnd`/`Direct`）与 `IsCompleteRecord` 的触发时机 ——
+目前最可疑的是「终止命令必须与最后一段需要打帧的数据在同一帧里」。
+
+---
+
+## V26 · 服务端 XTLS-Vision 端到端跑通（官方客户端 → 本服务端 → HTTP 200）
+
+```
+$ ./scripts/e2e-vision-test.sh
+==> 2/4 官方客户端 flow=xtls-rprx-vision → 期望 HTTP 200
+  ✓ https://example.com -> 200（flow=xtls-rprx-vision）      ← 第一次尝试就成功
+==> 3/4 回归：官方客户端 flow 留空 → 必须仍然 200
+  ✓ https://example.com -> 200（flow 留空，裸路径未回归）
+==> 4/4 抗探测：未认证的 TLS 探测者必须看到 dest 的真实证书
+  ✓ 探测者看到 dest 的真实证书（CN=www.cloudflare.com, EC）
+
+  Vision 服务端端到端全部通过。
+```
+
+服务端日志的外部证据：
+
+```
+[server] ts=2026-09-16T11:31:12Z dir=in src=127.0.0.1:49693 sni=www.cloudflare.com \
+         ver=26.3.27 sid=7ced… target=example.com:443 outcome=Forwarded \
+         dur_ms=1022 up_bytes=578 down_bytes=4894
+```
+
+### 两个真正的根因（V25 的「回程组帧未被接受」判断不成立）
+
+#### (a) 收到对端 `DIRECT` 时**误把写侧一起切了** —— 竞态
+
+XTLS-Vision 两个方向各自独立协商（upstream：
+`UplinkWriterDirectCopy` / `DownlinkReaderDirectCopy` 四个标志位）：
+
+* 我们发 `DIRECT` → 对端**读侧**切裸字节 → 我们**写侧**跟着切；
+* 对端发 `DIRECT` → 我们**读侧**切裸字节 → 我们**写侧不动**。
+
+`switch_both_to_raw()` 把两个方向一起切了。客户端一看到自己的 TLS 应用数据
+就会发 `DIRECT`；只要它比我们**先**发，我们就停止组帧、开始裸写，而客户端
+的读侧还在解帧：
+
+```
+官方客户端日志（loglevel=debug）：
+  proxy: Xtls Unpadding new block, content 3535 padding 160 command 0
+  proxy: XtlsPadding 86 1293 2                     ← 客户端发出自己的 DIRECT
+  proxy/vless/outbound: failed to transfer response payload \
+      > local error: tls: bad record MAC            ← 我们的裸字节被当成密文
+```
+
+**是竞态**：谁先发 `DIRECT` 决定成败 → 时红时绿，最难定位的一条。
+
+修法：拆成 `switch_read_to_raw()`（对端 `DIRECT` 触发，只动读侧）与只由
+**我们自己发终止帧**触发的 `enable_inner_raw_write_passthrough()`。
+回归测试 `peer_direct_must_not_stop_our_write_framing`：用**真 REALITY 两端**
+复现当年那个时序（对端先 `DIRECT`，服务端随后写回响应），断言响应**仍然是帧**。
+把旧写法改回去，它立刻变红 —— 已实测。
+
+#### (b) `DIRECT` 帧的 padding 没走完就去读内层 → `aead::Error`
+
+帧命令要等**整帧**（含 padding）走完才生效。读循环在交出一帧的 `content` 后
+直接去读内层，而对端此刻已切裸字节：
+
+```
+TLS AES-128-GCM decrypt: aead::Error
+```
+
+修法：`poll_read` 每轮先给解析器喂空切片，把 `parser.pending` 里的残留
+（正是 padding）榨干，再决定是否读内层。
+**为什么离线对拍照不出来**：`upstream_unpadding_accepts_our_wire_bytes`
+是「一次喂完整段」，帧与裸字节在同一段里 —— 这条 bug 只在
+「padding 与随后的裸字节分处不同 TCP 段」时暴露。
+
+#### (c) 目标站不是 TLS 时，回程数据被永久扣住
+
+`coalesce` 里的字节只在 `out_tls.is_tls()` 为真时才交付；明文 HTTP 目标下
+永远不为真。症状：服务端 `up_bytes=78 down_bytes=129`，`curl` 拿
+`(52) Empty reply from server`。修法见 `flush_coalesced()`，
+回归测试 `vision_pair_relays_plain_http_response`。
+
+#### (d) 两侧 `poll_write` 把「上一帧的 consumed」当成当前 buf 的写入量
+
+在途帧推完后必须继续给当前 `buf` 组帧；`return Ok(consumed)` 里的数字属于
+**上一个 buf**，调用方会据此跳过 `buf` 开头同样多的字节 → 丢数据。
+`RealityTlsStream::poll_write` 早就写明正确做法，两个 Vision 写侧现已对齐。
+
+### 附带修正：验收脚本把自己的输出吃掉了
+
+`fetch_code` 的重试进度打到 **stdout**，而调用方是 `CODE=$(fetch_code ...)`
+—— 第一次重试之后 `$CODE` 变成 `"  … 第 1 次失败（000），重试\n200"`，
+`[ "$CODE" = "200" ]` 永远为假。症状极具误导性：客户端日志干净、
+服务端日志 `outcome=Forwarded`，脚本却报 000/✗。
+进度信息改到 stderr 后立刻变绿（`scripts/e2e-vision-test.sh`）。
+
+### 判据
+
+| 检查 | 结果 |
+|---|---|
+| `./scripts/check.sh` | ✅ 9/9 |
+| `cargo test --workspace` | ✅ 全绿（24 / 8 / 37 / 59，含新增的两条 Vision 回归测试） |
+| `e2e-vision-test.sh` | ✅ 4/4（第 2 条首次尝试即 200） |
+| `e2e-wasm-to-wasm-test.sh` | ✅ 5/5 —— 第 4 步已**收紧**为「带 Vision 的自环也必须 200 且服务端记 Forwarded」（原来是「失败也算过」） |
+| `e2e-server-test.sh` | ✅ 未回归 |
+| `e2e-test.sh` | ❌ 红 —— **既有问题**，V27 给出定性与 HEAD 复现证据 |
+
+---
+
+## V27 · `e2e-test.sh` 的红：定性为既有问题（不是本方案的回归）
+
+### 现象
+
+```
+$ ./scripts/e2e-test.sh
+==> 5/8 经隧道取一个真实页面（带正确凭据）
+[socks5] 127.0.0.1:52988 失败：REALITY 握手失败：
+         tls handshake: Reality TLS: handshake did not complete within 10s
+  ✗ curl 失败
+```
+
+即：**wasm 客户端 → stock Xray 服务端** 的 REALITY 握手卡住。
+注意失败点在 REALITY 握手，**早于 VLESS / Vision**。
+
+### 定性：既有问题，与 V26 的改动无关
+
+在 `/tmp/xw-base` 建了一个 **HEAD（`2705e40`）的干净 worktree**，用同一份
+xray 二进制（26.3.27 d2758a0）跑同一条命令 —— **逐字复现同一个失败**
+（`REALITY 握手失败 … 10s`）。HEAD 上 `xt-wasm-tls` 与
+`xt-wasm-runtime` 与本次工作前的版本一致（`git status` 里它们未被修改），
+所以这不是本方案引入的回归。
+
+### 进一步定位（服务端日志 + 客户端侧埋点）
+
+stock 服务端认为握手成功并写完了飞行包：
+
+```
+REALITY remoteAddr: 127.0.0.1:54052  len(s2cSaved): 3734  Server Hello: 127
+REALITY remoteAddr: 127.0.0.1:54052  hs.handshake() err: <nil>
+REALITY remoteAddr: 127.0.0.1:54052  hs.readClientFinished() err: EOF
+```
+
+而 wasm 客户端停在**读第一个 5 字节记录头**上，且 WASI 的就绪通知始终没来：
+
+```
+XDBG-NET: poll_read remaining=5 cached_ready=false fresh_ready=false
+```
+
+对照实验（都实测过）：
+
+| 组合 | 结果 |
+|---|---|
+| 本工程 wasm 客户端 → **冷启动的** stock Xray 服务端 | ❌ 首次握手卡住；**同一个服务端上第 2、3 次连接全部成功** |
+| 官方 Xray 客户端 → 同一个冷启动 stock Xray 服务端 | ✅ 握手成功（`readClientFinished err: <nil>`） |
+| 本工程 wasm 客户端 → 本工程 wasm 服务端 | ✅ 成功（`e2e-wasm-to-wasm-test.sh`） |
+
+所以：**「wasm 客户端 ↔ 冷启动 stock Xray 服务端」这个组合**会卡在
+「已注册就绪、数据到达后却没被唤醒」上，属于 `xt-wasm-runtime` 的 WASI
+pollable 就绪语义问题（[WASI 社区也确认过该语义很弱](https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/input-stream.20pollable.20read-readiness.20guarantees.html)），
+不在本方案的改动范围内，暂按已知问题记录，不掩盖、也不放宽断言。
+
+### 判据表里被更正的一处
+
+V25 的表格里 `e2e-test.sh` 写成「✅ 未回归」——**当时并没有真的跑过这一条**
+（只跑了另外两条 e2e）。V27 把它更正为 ❌ 并附上 HEAD 复现证据。

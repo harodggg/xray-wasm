@@ -12,7 +12,8 @@
 //!
 //! 参数：私钥(hex) / shortId(hex) / SNI / dest(认证失败时转发到哪) / 允许的 UUID(hex) / 端口
 //!
-//! **注意**：服务端尚未实现 Vision 流控，所以官方客户端必须把 `flow` 置空。
+//! 支持的 `flow`：空（裸路径）与 `xtls-rprx-vision`（服务端已实现解帧 + 组帧）。
+//! 其它 flow 名会被**明确拒绝**，不会静默降级。
 
 use xt_wasm_runtime::{block_on, listen, spawn_task};
 use xt_wasm_tls::RealityServerConfig;

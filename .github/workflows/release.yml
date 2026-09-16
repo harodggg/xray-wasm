@@ -285,20 +285,33 @@ jobs:
 
             全部参数都有对应的 `XT_*` 环境变量（命令行优先），便于 k8s 用 Secret 注入。
 
-            ## 互操作（哪两端、要不要 `--no-flow`）
+            ## 互操作（四种组合都通）
 
             | 客户端 | 服务端 | 结果 |
             |---|---|---|
-            | 官方 Xray（v2rayN / 小火箭 / `xray` 二进制） | 本工程 wasm 服务端 | ✅ 配置里 `flow` 必须留空 |
-            | 本工程 wasm 客户端（默认） | 官方 Xray 服务端 | ✅ |
+            | 官方 Xray（v2rayN / 小火箭 / `xray` 二进制） | 本工程 wasm 服务端 | ✅ `flow: "xtls-rprx-vision"` 直接可用 |
+            | 本工程 wasm 客户端（默认，带 Vision） | 官方 Xray 服务端 | ✅ |
+            | 本工程 wasm 客户端（默认，带 Vision） | 本工程 wasm 服务端 | ✅ |
             | 本工程 wasm 客户端 `--no-flow` | 本工程 wasm 服务端 | ✅ |
-            | 本工程 wasm 客户端（默认带 Vision） | 本工程 wasm 服务端 | ❌ 被**明确拒绝**，不静默降级 |
 
-            > **`--no-flow`（或 `XT_NO_FLOW=1`）同时关掉 flow 声明和客户端侧 Vision 分帧。**
-            > 只关一半会得到「连上了但数据是坏的」—— 两者必须同进同退。
+            > 不认识的 `flow` 名仍会被**明确拒绝**，不会静默降级。
+            > `--no-flow`（或 `XT_NO_FLOW=1`）只在「对端只认空 flow」时需要 ——
+            > 它同时关掉 flow 声明和客户端侧 Vision 分帧，两者必须同进同退
+            > （只关一半会得到「连上了但数据是坏的」）。
 
-            > 服务端侧 XTLS-Vision 尚未实现：带非空 flow 的请求会被**明确拒绝**，
-            > `reason` 里会写清客户端该怎么改。
+            ## 服务端 XTLS-Vision（本版新增）
+
+            服务端现在**双向**实现了 XTLS-Vision 流控（解帧 + 组帧），官方客户端
+            带 `flow: "xtls-rprx-vision"` 经本服务端取真实网页拿到 HTTP 200：
+
+            ```
+            [server] ts=… dir=in sni=www.cloudflare.com ver=26.3.27 target=example.com:443 \
+                     outcome=Forwarded dur_ms=1022 up_bytes=578 down_bytes=4894
+            ```
+
+            两个关键语义（都写进了单测，改回去立刻变红）：
+            * 收到对端的 `DIRECT` **只切读侧**，写侧必须继续组帧直到我们自己发终止帧；
+            * `DIRECT` 帧的 padding 走完之前不能去读内层（否则会拿裸字节喂外层 TLS）。
 
             ## 服务端可观测性
 

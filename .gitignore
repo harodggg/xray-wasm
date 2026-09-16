@@ -41,3 +41,10 @@
 /.e2e-spin-server.log
 /.e2e-spin-xray.log
 /.e2e-spin-client.json
+
+# Vision 服务端端到端（scripts/e2e-vision-test.sh）
+/.e2e-vision-srv.log
+/.e2e-vision-client.log
+/.e2e-vision-client.json
+/.e2e-vision-empty.log
+/.e2e-vision-empty.json

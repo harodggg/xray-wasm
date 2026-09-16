@@ -5,8 +5,8 @@
 #
 # 这是三道 e2e 里最后补齐的一道，也是唯一一道两端都是本工程的：
 #
-#   e2e-test.sh              wasm 客户端 → stock Xray 服务端
-#   e2e-server-test.sh       stock Xray 客户端 → wasm 服务端
+#   e2e-test.sh              wasm 客户端 → 官方 Xray 服务端
+#   e2e-server-test.sh       官方 Xray 客户端 → wasm 服务端
 #   e2e-wasm-to-wasm-test.sh wasm 客户端 → wasm 服务端   ← 本文件
 #
 # 前两道各自只覆盖了一半，两端都是自己的组合此前**从来没跑过**。

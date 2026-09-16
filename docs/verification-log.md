@@ -128,7 +128,7 @@ SystemTime::now() -> unix=1789438743  plausible=true
 这是开工前最关键的验证。现代 Chrome 指纹会带后量子混合密钥交换 X25519MLKEM768
 （见下），而待移植的实现是纯 X25519。若服务端只认 MLKEM，方案就要额外背上 ML-KEM 依赖。
 
-用官方客户端逐个指纹对**本地 stock Xray v26.3.27 REALITY 服务端**测试，服务端日志：
+用官方客户端逐个指纹对**本地 官方 Xray v26.3.27 REALITY 服务端**测试，服务端日志：
 
 ```
 # fingerprint: chrome （后量子混合）
@@ -149,7 +149,7 @@ proxy/vless/inbound: received request for tcp:example.com:443
 
 ## V8 · 参照链路（官方客户端）可作为对拍基准
 
-本地 stock Xray 服务端 + 官方客户端：
+本地 官方 Xray 服务端 + 官方客户端：
 
 ```
 $ curl --proxy socks5h://127.0.0.1:1080 https://example.com
@@ -294,7 +294,7 @@ REALITY remoteAddr: 127.0.0.1:54297
 
 ```
 $ ./scripts/e2e-test.sh
-==> 1/4 确保 stock Xray REALITY 服务端在跑
+==> 1/4 确保 官方 Xray REALITY 服务端在跑
   ✓ 服务端已在 127.0.0.1:8443
 ==> 2/4 启动 wasm 客户端（SOCKS5）
   ✓ 客户端已监听 127.0.0.1:1080
@@ -807,7 +807,7 @@ $ ./scripts/e2e-server-test.sh
   ✓ privateKey/publicKey/shortId/uuid 已生成
 ==> 1/5 启动 wasm 服务端（server 子命令 + 环境变量传 Secret）
   ✓ 服务端已监听 127.0.0.1:9443
-==> 2/5 stock Xray 客户端（flow 必须留空）→ 经隧道取页面
+==> 2/5 官方 Xray 客户端（flow 必须留空）→ 经隧道取页面
   ✓ https://example.com -> 200
 ==> 3/5 服务端确实做了转发（而不是退化成了直连）
   ✓ 服务端日志：认证通过 user=2226339e-… -> example.com:443
@@ -978,7 +978,7 @@ for _, shortId := range c.ShortIds {
 已实测三种输入确认行为：`""` 拒绝、`","` 拒绝、`"0011223344556677,,aabbccdd"` 正常启动（空项被丢弃）。
 
 这是刻意的取舍（全零 shortId 意味着任何知道公钥的人都能通过 REALITY 认证），
-但它是**与 stock Xray 的功能差异**，此前没写下来，现在写了。
+但它是**与 官方 Xray 的功能差异**，此前没写下来，现在写了。
 
 ---
 
@@ -1108,8 +1108,8 @@ e2e 因此断言「非 0」而不是「恰好 2」，并在注释里写明原因
 |---|---|
 | 单测 | 100 → **109**（cli 24 / runtime 8 / tls 37 / vless 40） |
 | `./scripts/check.sh` | 9 项全绿 |
-| `./scripts/e2e-test.sh` | wasm 客户端 → stock 服务端 ✅ |
-| `./scripts/e2e-server-test.sh` | stock 客户端 → wasm 服务端 ✅ |
+| `./scripts/e2e-test.sh` | wasm 客户端 → 官方 Xray 服务端 ✅ |
+| `./scripts/e2e-server-test.sh` | 官方 Xray 客户端 → wasm 服务端 ✅ |
 | `./scripts/e2e-wasm-to-wasm-test.sh` | wasm `--no-flow` → wasm 服务端 ✅（新增，含半关闭回归守卫） |
 
 ---
@@ -2264,7 +2264,7 @@ $ ./scripts/e2e-test.sh
   ✗ curl 失败
 ```
 
-即：**wasm 客户端 → stock Xray 服务端** 的 REALITY 握手卡住。
+即：**wasm 客户端 → 官方 Xray 服务端** 的 REALITY 握手卡住。
 注意失败点在 REALITY 握手，**早于 VLESS / Vision**。
 
 ### 定性：既有问题，与 V26 的改动无关
@@ -2277,7 +2277,7 @@ xray 二进制（26.3.27 d2758a0）跑同一条命令 —— **逐字复现同�
 
 ### 进一步定位（服务端日志 + 客户端侧埋点）
 
-stock 服务端认为握手成功并写完了飞行包：
+官方 Xray 服务端认为握手成功并写完了飞行包：
 
 ```
 REALITY remoteAddr: 127.0.0.1:54052  len(s2cSaved): 3734  Server Hello: 127
@@ -2295,11 +2295,11 @@ XDBG-NET: poll_read remaining=5 cached_ready=false fresh_ready=false
 
 | 组合 | 结果 |
 |---|---|
-| 本工程 wasm 客户端 → **冷启动的** stock Xray 服务端 | ❌ 首次握手卡住；**同一个服务端上第 2、3 次连接全部成功** |
-| 官方 Xray 客户端 → 同一个冷启动 stock Xray 服务端 | ✅ 握手成功（`readClientFinished err: <nil>`） |
+| 本工程 wasm 客户端 → **冷启动的** 官方 Xray 服务端 | ❌ 首次握手卡住；**同一个服务端上第 2、3 次连接全部成功** |
+| 官方 Xray 客户端 → 同一个冷启动 官方 Xray 服务端 | ✅ 握手成功（`readClientFinished err: <nil>`） |
 | 本工程 wasm 客户端 → 本工程 wasm 服务端 | ✅ 成功（`e2e-wasm-to-wasm-test.sh`） |
 
-所以：**「wasm 客户端 ↔ 冷启动 stock Xray 服务端」这个组合**会卡在
+所以：**「wasm 客户端 ↔ 冷启动 官方 Xray 服务端」这个组合**会卡在
 「已注册就绪、数据到达后却没被唤醒」上，属于 `xt-wasm-runtime` 的 WASI
 pollable 就绪语义问题（[WASI 社区也确认过该语义很弱](https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/input-stream.20pollable.20read-readiness.20guarantees.html)），
 不在本方案的改动范围内，暂按已知问题记录，不掩盖、也不放宽断言。

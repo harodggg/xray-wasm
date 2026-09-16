@@ -1,11 +1,11 @@
 #!/bin/sh
-# 端到端测试：**stock Xray 客户端 → 我们的 wasm REALITY 服务端** → 外网。
+# 端到端测试：**官方 Xray 客户端 → 我们的 wasm REALITY 服务端** → 外网。
 #
 #     ./scripts/e2e-server-test.sh
 #
 # 与 e2e-test.sh 正好是镜像关系：
-#   e2e-test.sh        我们的 wasm 客户端 → stock Xray 服务端
-#   e2e-server-test.sh stock Xray 客户端 → 我们的 wasm 服务端
+#   e2e-test.sh        我们的 wasm 客户端 → 官方 Xray 服务端
+#   e2e-server-test.sh 官方 Xray 客户端 → 我们的 wasm 服务端
 #
 # 四条用例，后两条才是真正容易出事的部分：
 #   1. 认证过的客户端能拿到页面（VLESS 应答头、目标解析、双向 relay 都对了）
@@ -133,7 +133,7 @@ write_client_cfg() {
 EOF
 }
 
-echo "==> 2/5 stock Xray 客户端（flow 必须留空）→ 经隧道取页面"
+echo "==> 2/5 官方 Xray 客户端（flow 留空：裸路径回归）→ 经隧道取页面"
 CFG="$XW_DIR/.e2e-srv-client.json"
 write_client_cfg "$CFG" "$UUID" "$SPORT"
 "$XRAY" run -c "$CFG" >"$XW_DIR/.e2e-srv-client.log" 2>&1 &
@@ -141,7 +141,7 @@ CLIENT_PID=$!
 sleep 3
 nc -z 127.0.0.1 "$SPORT" 2>/dev/null || {
     cat "$XW_DIR/.e2e-srv-client.log" >&2
-    fail "stock 客户端没有监听 SOCKS $SOCKS"
+    fail "官方 Xray 客户端没有监听 SOCKS $SOCKS"
 }
 # 这一步要出公网，会有偶发的瞬时抖动（本机实测遇到过一次：
 # 服务端已经记下「认证通过 → example.com:443」，但 curl 侧没等到响应）。

@@ -101,7 +101,7 @@ fn usage() -> ! {
                        协商阶段读超时秒数（默认 {}）。防止「连上不发数据」的连接
                        长期占住一个并发槽位。
   --no-flow            不发 XTLS-Vision flow 声明，也不做客户端侧 Vision 分帧。
-                       **默认不需要**：本工程的服务端与 stock Xray 服务端都支持
+                       **默认不需要**：本工程的服务端与官方 Xray 服务端都支持
                        Vision。只在「对端只认空 flow」或排障时才加。
 
 环境变量（命令行参数优先，便于 k8s 用 Secret 注入而不用写进 args）：
@@ -109,11 +109,11 @@ fn usage() -> ! {
   XT_SOCKS_USER  XT_SOCKS_PASS  XT_HANDSHAKE_TIMEOUT  XT_NO_FLOW  XT_SELF_TEST
 
 互操作（默认走 Vision；四种组合都必须能通）：
-  wasm 客户端（默认）    →  wasm 服务端         ✅
-  wasm 客户端（默认）    →  stock Xray 服务端   ✅
-  wasm 客户端 --no-flow  →  wasm 服务端         ✅（flow 为空是合法配置）
-  wasm 客户端 --no-flow  →  stock Xray 服务端   ✅
-  未知 flow 名           →  任一服务端         ❌ 明确拒绝，不静默降级",
+  wasm 客户端（默认）    →  wasm 服务端       ✅
+  wasm 客户端（默认）    →  官方 Xray 服务端  ✅
+  wasm 客户端 --no-flow  →  wasm 服务端       ✅（flow 为空是合法配置）
+  wasm 客户端 --no-flow  →  官方 Xray 服务端  ✅
+  未知 flow 名           →  任一服务端        ❌ 明确拒绝，不静默降级",
         version_string(RealityConfig::DEFAULT_CLIENT_VERSION),
         DEFAULT_HANDSHAKE_TIMEOUT_SECS
     );

@@ -189,7 +189,7 @@ jobs:
         run: |
           echo "===== wasm 服务端日志 ====="
           cat .e2e-srv-wasm.log 2>/dev/null || echo "(无)"
-          echo "===== stock 客户端日志 ====="
+          echo "===== 官方 Xray 客户端日志 ====="
           cat .e2e-srv-client.log 2>/dev/null || echo "(无)"
           echo "===== 错误 UUID 客户端日志 ====="
           cat .e2e-srv-bad.log 2>/dev/null || echo "(无)"

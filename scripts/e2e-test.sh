@@ -1,5 +1,5 @@
 #!/bin/sh
-# 端到端测试：wasm 客户端 → 本地 stock Xray REALITY 服务端 → 外网。
+# 端到端测试：wasm 客户端 → 本地 官方 Xray REALITY 服务端 → 外网。
 #
 #     ./scripts/e2e-test.sh
 #
@@ -57,7 +57,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> 1/8 确保 stock Xray REALITY 服务端在跑"
+echo "==> 1/8 确保 官方 Xray REALITY 服务端在跑"
 if nc -z 127.0.0.1 8443 2>/dev/null; then
     pass "服务端已在 127.0.0.1:8443"
 else

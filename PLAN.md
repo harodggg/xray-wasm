@@ -111,8 +111,8 @@ xray-wasm/
 | M1 | 移植 `reality_tls.rs`，剥离 tokio runtime | wasm 内完成一次到**真实 Xray REALITY 服务端**的 TLS1.3 握手，且服务端确认 `isHandshakeComplete=true` | ✅ **完成**（V11 修复 + V12，226ms） |
 | M2 | 移植 VLESS 头 + Vision | 能将一个 TCP 流经隧道送到目标并回传 | ✅ **完成**（V13，服务端日志 `received request for tcp:example.com:443`） |
 | M3 | CLI + 本地端到端 | 经 wasm 隧道拿到真实网页 | ✅ **完成**（V13，`curl --proxy socks5h://…` → HTTP 200） |
-| M4 | 硬化 | 超时/错误路径、无 `unwrap` panic、与 stock Xray 客户端对拍线格式 | ✅ **完成**（V14 对拍 `ServerHello` 127 字节与官方一致并修复 `ClientVer` 互通；V16/V17 换成非阻塞 socket + reactor 就绪通知；对拍与错误路径用例均入 CI） |
-| M5 | REALITY **入站**（服务端） | stock Xray 客户端经我们的服务端代理到真实网站；未认证探测者看到 `dest` 的真实证书 | ✅ **完成**（V18/V19/V20，六个阶段全部落地） |
+| M4 | 硬化 | 超时/错误路径、无 `unwrap` panic、与 官方 Xray 客户端对拍线格式 | ✅ **完成**（V14 对拍 `ServerHello` 127 字节与官方一致并修复 `ClientVer` 互通；V16/V17 换成非阻塞 socket + reactor 就绪通知；对拍与错误路径用例均入 CI） |
+| M5 | REALITY **入站**（服务端） | 官方 Xray 客户端经我们的服务端代理到真实网站；未认证探测者看到 `dest` 的真实证书 | ✅ **完成**（V18/V19/V20，六个阶段全部落地） |
 | M6 | 服务端 CLI + k3s 交付 | `server` 子命令、两个方向的 e2e 入 CI、可部署清单、发版产物 | ✅ **完成**（V21） |
 | M7 | 自环互通 + 可诊断性 | `--no-flow`（wasm↔wasm 打通）、结构化单行日志、解析/连接失败可分辨、`--check` 自检、三道 e2e 入 CI | ✅ **完成**（V22） |
 
@@ -121,12 +121,12 @@ xray-wasm/
 
 | 脚本 | 方向 |
 |---|---|
-| `scripts/e2e-test.sh` | 我们的客户端 → stock 服务端 |
-| `scripts/e2e-server-test.sh` | stock 客户端 → 我们的服务端 |
+| `scripts/e2e-test.sh` | 我们的客户端 → 官方 Xray 服务端 |
+| `scripts/e2e-server-test.sh` | 官方 Xray 客户端 → 我们的服务端 |
 | `scripts/e2e-wasm-to-wasm-test.sh` | 我们的客户端 `--no-flow` → 我们的服务端（自环） |
 | `scripts/e2e-vision-test.sh` | 官方客户端 `flow=vision` → 我们的服务端（**4/4 通过**；第 2 条 HTTP 200） |
 
-**互操作矩阵**（细节见 README）：stock→wasm ✅（flow 留空）、wasm→stock ✅、
+**互操作矩阵**（细节见 README）：官方→wasm ✅（flow 留空）、wasm→官方 ✅、
 wasm（默认带 Vision）→wasm ✅、wasm `--no-flow`→wasm ✅。
 
 详见 `docs/verification-log.md` V13/V15/V21/V22。

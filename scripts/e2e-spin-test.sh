@@ -69,7 +69,7 @@ for p in "$LPORT" "$SPORT"; do
     fi
 done
 
-echo "==> 1/4 起 wasm 服务端 + stock 客户端（目标指向本地 echo）"
+echo "==> 1/4 起 wasm 服务端 + 官方 Xray 客户端（目标指向本地 echo）"
 python3 -c "
 import socket, threading
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

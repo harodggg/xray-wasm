@@ -1353,7 +1353,7 @@ Two further notes on `build_padding_frame` (`vision.rs:283-292`): the `padding_t
 2. **Port the 16 runtime-free `reality_tls.rs` tests first** (§6.1 #1-7, #9-11, #13-18). They are the regression net and they prove the port preserved the wire semantics. Then add #19 with an in-memory duplex.
 3. **Build the socket bridge** (`xt-wasm-runtime`): a `Stream` impl over `std::net::TcpStream` with `set_nonblocking(true)` + a poll reactor returning `Poll::Pending`/wakers (or `wasi:io/poll`), plus an executor entry point. This is the only genuinely new subsystem. Verify full duplex with a loopback echo before touching VLESS.
 4. **`xt-wasm-vless`**: copy `header.rs` verbatim (swap `SmolStr`→`String`), copy `vision.rs` verbatim, copy `conn.rs:1-327` only. Port the 10 runtime-free `header.rs` tests + all 6 `vision.rs` tests; then the 8 TCP `conn.rs` tests with `futures::executor::block_on` + `join!`.
-5. **Wire it up**: `reality_handshake` → `VlessConn::new_deferred` → `VisionConn::new`. Validate against a local Xray REALITY server per `PLAN.md` §6, and byte-compare the ClientHello against stock Xray.
+5. **Wire it up**: `reality_handshake` → `VlessConn::new_deferred` → `VisionConn::new`. Validate against a local Xray REALITY server per `PLAN.md` §6, and byte-compare the ClientHello against upstream Xray.
 6. **Never** add `boring`, `tokio-boring`, `boring-sys`, `mio`, `tokio`'s `net`/`fs`/`process`/`signal`/`rt-multi-thread` features, `parking_lot`, `socket2`, `libc`-for-anything-but-nonblocking-poll, or any `tokio::time` use outside tests.
 
 ### Reproduction of the wasip2 evidence in this document

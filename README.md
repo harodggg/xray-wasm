@@ -135,11 +135,11 @@ cargo build -p xt-wasm-cli --release --target wasm32-wasip2
 两个方向的端到端验收（都需要官方 `xray` 二进制，脚本会现场生成全新凭据）：
 
 ```sh
-# 客户端方向：我们的 wasm 客户端 → stock Xray REALITY 服务端 → 外网
+# 客户端方向：我们的 wasm 客户端 → 官方 Xray REALITY 服务端 → 外网
 ./scripts/gen-test-server.sh && . .test-server/params.env
 XW_XRAY_DIR=$PWD/.test-server ./scripts/e2e-test.sh
 
-# 服务端方向：stock Xray 客户端 → 我们的 wasm REALITY 服务端 → 外网
+# 服务端方向：官方 Xray 客户端 → 我们的 wasm REALITY 服务端 → 外网
 ./scripts/e2e-server-test.sh
 ```
 
@@ -334,11 +334,11 @@ guest exit(42) -> rc=1
 
 | 限制 | 影响 |
 |---|---|
-| **`e2e-test.sh`（wasm 客户端 → stock Xray 服务端）红** | 与 Vision 无关：本工程 wasm 客户端到**冷启动的** stock Xray 服务端首次 REALITY 握手会卡住（HEAD 干净 worktree 上逐字复现，见 `docs/verification-log.md` V27）。官方客户端不受影响 |
+| **`e2e-test.sh`（wasm 客户端 → 官方 Xray 服务端）红** | 与 Vision 无关：本工程 wasm 客户端到**冷启动的** 官方 Xray 服务端首次 REALITY 握手会卡住（HEAD 干净 worktree 上逐字复现，见 `docs/verification-log.md` V27）。官方客户端不受影响 |
 | **只支持 VLESS TCP** | 无 UDP、无 Mux、无 `xtls-rprx-vision-udp443` |
 | **single-hop，无 uTLS 服务端指纹伪装** | 证书与握手形状按 REALITY 要求构造，但不做额外的 TLS 栈指纹伪装 |
 | **并发上限 256**（`MAX_CONCURRENT_CONNS`） | 满了会等槽位而不是丢弃连接 |
-| **空 shortId 无法表达**（见下） | 从 stock Xray 迁移一份含 `shortIds: [""]` 的配置会**拒绝启动** |
+| **空 shortId 无法表达**（见下） | 从 官方 Xray 迁移一份含 `shortIds: [""]` 的配置会**拒绝启动** |
 
 #### 空 shortId：一个容易搞反的语义，以及我们的取舍
 
@@ -366,11 +366,11 @@ for _, shortId := range c.ShortIds {
 
 **本工程的取舍**：`XT_SHORT_IDS` 按逗号切分时会丢掉空项，因此**没法注册那个全零 key**，
 `XT_SHORT_IDS=""` 会被当成「一个都没配」并拒绝启动。后果是：
-从 stock Xray 迁移配置时，若原配置里有 `""`，本服务端起不来（报错明确，不会静默）。
+从 官方 Xray 迁移配置时，若原配置里有 `""`，本服务端起不来（报错明确，不会静默）。
 
 这是**刻意的**：全零 shortId 意味着任何知道公钥的人都能通过 REALITY 认证，
 只靠 UUID 兜底。我们选择让这种配置必须显式改成真实 shortId 而不是默认放行。
-如果你的部署确实依赖空 shortId，**当前版本不支持**，请继续用 stock Xray。
+如果你的部署确实依赖空 shortId，**当前版本不支持**，请继续用 官方 Xray。
 
 ---
 
@@ -407,8 +407,8 @@ xray-wasm/
     env.sh               构建/运行环境
     gen-test-server.sh   生成一次性测试服务端
     run-local.sh         wasmtime 启动封装
-    e2e-test.sh          端到端：我们的客户端 → stock 服务端
-    e2e-server-test.sh   端到端：stock 客户端 → 我们的服务端
+    e2e-test.sh          端到端：我们的客户端 → 官方 Xray 服务端
+    e2e-server-test.sh   端到端：官方 Xray 客户端 → 我们的服务端
     build-image.sh       构建容器镜像
 ```
 
@@ -536,7 +536,7 @@ curl -sS 'https://crates.io/api/v1/crates?q=reality'   # 无第二个服务端
 
 | 限制 | 影响 | 说明 |
 |---|---|---|
-| **`e2e-test.sh`（wasm 客户端 → stock Xray 服务端）红** | 与本工程的 Vision 无关 | 冷启动的 stock Xray 服务端上，本工程 wasm 客户端首次 REALITY 握手会卡住；HEAD 上逐字复现，见 `docs/verification-log.md` V27 |
+| **`e2e-test.sh`（wasm 客户端 → 官方 Xray 服务端）红** | 与本工程的 Vision 无关 | 冷启动的 官方 Xray 服务端上，本工程 wasm 客户端首次 REALITY 握手会卡住；HEAD 上逐字复现，见 `docs/verification-log.md` V27 |
 | **TLS 指纹非浏览器形状** | 功能可用，但抗 JA3/JA4 与主动探测弱于官方客户端 | 手写 ClientHello 未实现 uTLS 的 Chrome 伪装 |
 | **无 XTLS-Vision DIRECT splice** | 仅性能差异，不影响连通 | 功能路径完整 |
 | **无 UDP / Mux / 后量子** | QUIC / HTTP3 经此代理不可用 | ML-KEM、ML-DSA-65、`VlessPacketConn` 均未实现 |

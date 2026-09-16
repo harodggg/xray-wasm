@@ -249,7 +249,7 @@ frame3 cmd=0x02 (DIRECT, 17…完整)   isComplete=true  xtls=true
 | `cargo test --workspace` | ✅ 全绿（24 / 8 / 37 / 58） |
 | `e2e-wasm-to-wasm-test.sh` | ✅ 5/5（第 4 步已收紧为「带 Vision 的自环也必须 200」） |
 | `e2e-server-test.sh` | ✅ 未回归 |
-| `e2e-test.sh`（wasm 客户端 → stock Xray 服务端） | ❌ **红，但是既有问题**：在 HEAD 干净 worktree 上逐字复现（见 `docs/verification-log.md` V27），与本方案的改动无关 |
+| `e2e-test.sh`（wasm 客户端 → 官方 Xray 服务端） | ❌ **红，但是既有问题**：在 HEAD 干净 worktree 上逐字复现（见 `docs/verification-log.md` V27），与本方案的改动无关 |
 
 ---
 

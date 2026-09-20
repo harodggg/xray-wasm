@@ -299,7 +299,38 @@ jobs:
             > 它同时关掉 flow 声明和客户端侧 Vision 分帧，两者必须同进同退
             > （只关一半会得到「连上了但数据是坏的」）。
 
-            ## 服务端 XTLS-Vision（本版新增）
+            ## 客户端 ClientHello 指纹伪装（v0.7.0 新增）
+
+            客户端默认不再发那个「1 个 cipher、无 GREASE」的最小 ClientHello，而是按
+            profile 组装，**默认 `chrome`**：cipher 列表、扩展集合、GREASE 模式、
+            GREASE ECH、ALPS、默认 ALPN 都对齐官方 Xray `fingerprint: chrome` 的形状
+            （权威对照是仓库里一份真实抓到的官方 ClientHello）。
+
+            ```sh
+            # 默认就是 chrome；要关掉伪装用 plain
+            --fingerprint chrome | plain        # 或 XT_FINGERPRINT
+            XT_CHECK=1 …                        # 自检里可见生效 profile 与 ALPN
+            ```
+
+            判据是可计算的（全部在 CI 里常态化跑）：**JA4 与官方夹包全等**、
+            逐字段差分只剩已声明的偏差；另有「真机裸 TCP 探针」证明线上字节确实是
+            浏览器形状（chrome：16 cipher / 18 扩展 / 含 ECH 与 ALPS / ALPN h2+http/1.1）。
+
+            **能力边界（请按这个理解，不要当成「完整 Chrome 指纹」）：**
+
+            * 只对齐**可观测字段**。真 Chrome 会声明 `X25519MLKEM768` 并带上它 1216 字节的
+              key_share，我们**两者都不发** —— 声明了却不提供对应 key_share 会触发对端
+              HelloRetryRequest（RFC 8446 §4.1.1），而本实现不支持 HRR，握手会直接失败
+              （实测 5/5 命中）。
+            * 因此**纯 X25519 是真实的密码学降级**：不具备抗「先存后解」的后量子性。
+            * ECH 只是 **GREASE 占位**（不是真 ECH，也不能解密）；形状等价于
+              「PQ 尚未默认开启的 Chrome」，版本年代假设未验证。
+            * 真 Chrome 的 JA3 每次连接都不同（扩展顺序被打乱），所以我们同样按连接
+              随机化扩展顺序 —— 否则「JA3 恒定」本身就是一个真 Chrome 没有的跨连接标签。
+            * 它**不改变** TLS 之外的特征（包长分布、时序、SNI、DNS），也不改证书链。
+            * 细节与残余风险：`docs/fingerprint-plan.md`、`docs/fingerprint-security.md`。
+
+            ## 服务端 XTLS-Vision（v0.6.0 新增）
 
             服务端现在**双向**实现了 XTLS-Vision 流控（解帧 + 组帧），官方客户端
             带 `flow: "xtls-rprx-vision"` 经本服务端取真实网页拿到 HTTP 200：

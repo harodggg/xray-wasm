@@ -8,10 +8,10 @@
 
 ```sh
 # 客户端（默认，无子命令）：本地 SOCKS5 → REALITY 隧道
-docker run --rm -e XT_SERVER=… -e XT_PBK=… ghcr.io/harodggg/xray-wasm:v0.6.0
+docker run --rm -e XT_SERVER=… -e XT_PBK=… ghcr.io/harodggg/xray-wasm:v0.7.0
 
 # 服务端（`server` 子命令）：REALITY 入站 → 目标站
-docker run --rm -e XT_PRIVATE_KEY=… ghcr.io/harodggg/xray-wasm:v0.6.0 server
+docker run --rm -e XT_PRIVATE_KEY=… ghcr.io/harodggg/xray-wasm:v0.7.0 server
 ```
 
 子命令写在**镜像名之后**（k8s 里就是 `args: ["server"]`）：镜像 ENTRYPOINT 是 exec

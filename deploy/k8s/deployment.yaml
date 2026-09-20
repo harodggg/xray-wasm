@@ -44,6 +44,18 @@ spec:
             # 客户端启动时会打印显式警告。
             - name: XT_LISTEN
               value: "0.0.0.0:1080"
+            # ClientHello 外观（浏览器指纹伪装）。默认就是 chrome，这里显式写出来
+            # 是为了让「这条 Deployment 到底伪装成什么」在清单里一眼可见、可改。
+            #
+            # 可选：chrome（默认，形状对齐官方客户端 fingerprint: chrome 的
+            # ClientHello）/ plain（不伪装，最小形状，便于排障与对照）。
+            # 未知名字**启动即失败**并列出可用名字 —— 不会静默回退。
+            #
+            # 能力边界与已知不一致点（只对齐可观测字段；不发 X25519MLKEM768、
+            # ECH 只是 GREASE 占位）见 docs/fingerprint-plan.md 与
+            # docs/fingerprint-security.md。
+            - name: XT_FINGERPRINT
+              value: "chrome"
           envFrom:
             - secretRef:
                 name: xray-wasm

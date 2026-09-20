@@ -197,6 +197,17 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
    客户端上报的版本必须落在区间内。默认 `26.3.27`；可用
    `XT_CLIENT_VER` 覆盖。设错的症状是握手失败（服务端会把你当探测流量转发到 dest，
    客户端侧看到的是「证书不是 Ed25519」）。
+6. **`XT_FINGERPRINT` 决定 ClientHello 长什么样（默认 `chrome`）。** 清单里显式写
+   成 `chrome`，让「这条 Deployment 伪装成什么」一眼可见、可改；填 `plain` 则不伪装
+   （最小形状，便于排障与对照）。认不出的名字会**启动即失败**并列出可用名字。
+   * 能力边界要说清楚：只对齐**可观测字段**（cipher 列表 / 扩展集合与顺序 /
+     ALPN / GREASE 模式…）。我们**不声明** `X25519MLKEM768` 也**不带**它的
+     key_share（发了会触发对端 HelloRetryRequest 而握手失败），ECH 只是 GREASE 占位，
+     扩展顺序按连接随机化；因此形状等价于「PQ 尚未默认开启的 Chrome」，
+     与当前最新 Chrome 有一处已知差异。**纯 X25519 也是真实的密码学降级**
+     （不具备抗「先存后解」的后量子性）。
+   * 判据与证明方式（JA4 与官方夹包全等、JA3 为何不能当判据、已知不一致点清单）见
+     `docs/fingerprint-plan.md` 与 `docs/fingerprint-security.md`。
 
 ### 服务端
 

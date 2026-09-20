@@ -2308,3 +2308,103 @@ pollable 就绪语义问题（[WASI 社区也确认过该语义很弱](https://b
 
 V25 的表格里 `e2e-test.sh` 写成「✅ 未回归」——**当时并没有真的跑过这一条**
 （只跑了另外两条 e2e）。V27 把它更正为 ❌ 并附上 HEAD 复现证据。
+
+---
+
+## V28 · 客户端 ClientHello 指纹伪装（浏览器形状）+ 三条实测结论
+
+**目标**：让客户端不再发那个「1 个 cipher、无 GREASE」的最小 ClientHello
+（它本身就是极强的指纹），改成对齐官方 Xray `fingerprint: chrome` 的形状。
+
+权威对照是仓库里一份**真实抓到**的官方 ClientHello：
+`crates/xt-wasm-tls/src/testdata/xray-clienthello.hex`（1787 字节，抓法见 V18），
+外加 T3 用 `scripts/capture-clienthello.sh` 新抓的 12 份样本。
+
+### 交付
+
+| 文件 | 内容 |
+|---|---|
+| `crates/xt-wasm-tls/src/fingerprint.rs`（新） | profile 引擎：`chrome` / `plain`；cipher 列表、扩展集合与顺序、GREASE、GREASE ECH、ALPS、默认 ALPN |
+| `crates/xt-wasm-tls/src/reality.rs` | `resolve_profile` / `reality_handshake_with_profile` / `build_reality_client_hello_with_profile`；层在**构造期**解析 profile，未知名字当场报错 |
+| `crates/xt-wasm-cli/src/main.rs` | `--fingerprint` / `XT_FINGERPRINT`（默认 `chrome`）、`--check` 自检打印生效 profile 与 ALPN、启动横幅 |
+| `deploy/k8s/deployment.yaml` | 显式 `XT_FINGERPRINT=chrome`（让「伪装成什么」在清单里可见） |
+| 测试 | 差分 20 条（`tests/fingerprint_differential.rs`）、安全 26 条（`tests/fingerprint_security.rs`）、reality.rs 新增 5 条（plain 基准 / profile 解析 / 线形状 / chrome 认证 / 层拒绝未知名） |
+
+### 三条实测结论（都改变了实现，不是风格问题）
+
+1. **声明 `X25519MLKEM768(11ec)` 却不给它 key_share ⇒ 连接直接失败。**
+   RFC 8446 §4.1.1：服务端选中的组没有对应 key_share 时 **MUST** 发
+   HelloRetryRequest。裸 socket 实验（5 个 SNI：cloudflare.com / www.cloudflare.com /
+   google.com / www.google.com / example.com）：
+   * 现在的 plain 形状 → ServerHello 正常（5/5）
+   * 声明 11ec 但不发它的 share → **HRR，且明确请求 11ec（5/5）**；而
+     `reality.rs` 明确把 HRR 判为错误、我们也没有 ML-KEM ⇒ 握手失败
+   * 决定性差分：把夹包里那条 1216 字节的 11ec share **只删掉**、其余字节不变 →
+     同一站点立刻从正常变 HRR
+   修法：`supported_groups` 与 `key_share` 都**不带** 11ec ⇒ 形状等价于
+   「PQ 尚未默认开启的 Chrome」。代价写明：这只是**真实的能力降级**
+   （纯 X25519，不具备抗「先存后解」）。
+
+2. **真 Chrome 的 JA3 每次连接都不同，JA4 才是稳定指纹。**
+   12–13 份官方样本：JA3 **12/12 互不相同**、JA4 **12/12 相同**（`t13d1516h2_8daaf6152771_d8a2da3f94cd`）、
+   扩展**集合**相同而**顺序**每连接被打乱；除顺序外没有任何段在变（cipher / 曲线 /
+   点格式 / legacy_version 都 12/12 恒定；首尾扩展恒为 GREASE、中间 16 个随机排列）。
+   于是：**固定顺序会让我们的 JA3 恒定**，而真 Chrome 是散列分布 —— 对能看多次
+   连接的观察者来说就是一个真 Chrome 没有的**跨连接标签**（已要求并实现
+   按连接随机化扩展顺序，`plain` 保持固定作为回归基准）。
+   判据因此定为：**JA4 全等是主判据**（JA4 不含 supported_groups、且把扩展排序），
+   JA3 只做「别恒定」的卫生检查。
+
+3. **写死 GREASE ECH 填充长度 ⇒ ClientHello 总长跨连接恒定**（TCP 层可见）。
+   12 份样本的 ECH 扩展长度 ∈ {186,218,250,282}（32 字节粒度）→ 载荷
+   {144,176,208,240}。修法：载荷长度按连接在四档里取。
+
+### 一个只有「真机探针」能抓到的接线缺口
+
+引擎（T1）全绿、CLI（T5）全绿、差分测试 20/20 绿 —— 但**生产路径仍然在手写
+最小 ClientHello**，`--fingerprint chrome` 与 `--fingerprint plain` 在线上**逐字节相同**。
+这是 T3 的裸 TCP 探针（冒充 REALITY 服务端，让真实 wasm 客户端连过来抓第一条
+record）抓出来的；单元级对拍永远发现不了，因为它测的是纯函数。
+
+修完后我用同一个探针独立复核（wasm 客户端 → 裸监听）：
+
+| profile | handshake 字节 | cipher 数 | 扩展数 | ECH(0xfe0d) | ALPS(0x44cd) | ALPN | 11ec |
+|---|---|---|---|---|---|---|---|
+| `chrome` | 597 | 16 | 18 | ✅ | ✅ | `h2` + `http/1.1` | 不出现 |
+| `plain` | 199 | 1 | 8 | ❌ | ❌ | 无 | 不出现 |
+
+### 判据与证据
+
+| 检查 | 结果 |
+|---|---|
+| `. ./scripts/check.sh` | ✅ **9/9**（含 17 个 k8s `XT_*` 变量与源码一致） |
+| `cargo test --workspace` | ✅ **192 passed / 0 failed**（28 / 8 / 51 / 20 / 26 / 59） |
+| 纯引擎对拍（差分 20 条） | ✅ JA4 与官方夹包**全等**；JA3 四段全等、`EllipticCurves` 精确 == 夹包去掉 11ec（`29-23-24`）；逐字段差分只剩 4 处**已声明**偏差 |
+| 真机矩阵（wasm 客户端 → wasm 服务端 → 真实站点） | ✅ chrome × example.com / www.cloudflare.com、plain × 同两者，**4/4 HTTP 200** |
+| `e2e-wasm-to-wasm-test.sh` | ✅ 5/5（默认 chrome 形状跑出来的） |
+| `e2e-vision-test.sh` | ✅ 4/4 |
+| wasm 体积 | 466,822 → **474,719** 字节（+7,897，约 +1.7%） |
+| chrome 形状仍能被本工程服务端认证 | ✅ `chrome_client_hello_authenticates_against_our_server`（真握手级：`parse_client_hello` + `authenticate`） |
+| 未知 profile 名 | ✅ 层构造期报错并列出可用名字（`layer_rejects_unknown_fingerprint_at_construction`）；CLI host 退出 2 / wasm 塌缩为 1 |
+
+### 仍然诚实的边界（未验证 / 明确的非目标）
+
+* **无后量子性**：纯 X25519 是真实降级，不具备抗「先存后解」。ML-KEM 需要 PQ
+  依赖 + wasm 体积，列为非目标。
+* **ECH 是 GREASE 占位**，不是真 ECH，也不能被解密；主动探测对照组实验**未做**。
+* **版本年代假设未验证**：我们说「等价于 PQ 之前的 Chrome（约 114/≤123）」，
+  但手上只有 26.3.27 这一个官方二进制，**没有旧版 Chrome/uTLS 夹包可比**。
+  到 2026 年老版本 Chrome 自然消亡后，「声称 Chrome 却无 PQ 组」的条件概率会
+  更偏向「伪装客户端」——这条残余风险已写进 `docs/fingerprint-security.md`。
+* **总长仍与真 Chrome 差约 1216 字节**（就是那份 ML-KEM share）：JA3/JA4 看不见，
+  但 TCP/record 长度可见。
+* 本特性**不改变** TLS 之外的特征（包长分布、时序、SNI、DNS），也不改变证书链。
+* 「uTLS 的扩展顺序是否严格均匀随机」在 12 条样本下**无法判定**；要检出
+  10% 量级的偏差约需 500–2000 条抓包（口径见 `docs/fingerprint-security.md`）。
+
+### 过程记录（团队）
+
+T3/T4 的执行者（testing / security）在收尾前**中途失败**，落盘产物（差分测试、
+安全测试、抓包脚本、两份 docs）完整且全绿；缺口部分（接线后的真机探针复核、
+真机矩阵、层构造期拒绝未知名）由 lead 补跑并复核，任务的写入范围与结论归因
+已在 `docs/fingerprint-*.md` 与本节中标注。

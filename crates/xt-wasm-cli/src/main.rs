@@ -61,6 +61,18 @@ struct Args {
     short_id: [u8; 8],
     /// REALITY ClientVer。服务端设了 minClientVer/maxClientVer 时决定成败。
     client_version: [u8; 3],
+    /// ClientHello 指纹 profile 名（`--fingerprint` / `XT_FINGERPRINT`）。
+    ///
+    /// 默认 [`xt_wasm_tls::fingerprint::DEFAULT_PROFILE_NAME`]（`chrome`）；
+    /// 空串（k8s 里没填的字段常是空串）按未设置处理，取默认。
+    /// **未知名字是配置错误，启动即失败** —— 绝不静默回退到别的 profile。
+    /// 只改 TLS 外观，不改 REALITY 认证；能力边界见 `docs/fingerprint-plan.md`。
+    fingerprint: String,
+    /// 只做配置自检并退出（`--check` / `XT_CHECK=1`），与 `server --check` 对齐。
+    ///
+    /// ⚠️ wasmtime 会把 guest 的退出码塌缩成 0 / 非 0（见 README「两个平台层面的坑」），
+    /// 所以可观察契约只有 **0 / 非 0**，脚本不要断言 `== 2`。
+    check: bool,
     sni: String,
     uuid: String,
     listen: String,
@@ -94,6 +106,11 @@ fn usage() -> ! {
 可选：
   --client-ver x.y.z   REALITY 上报的客户端版本（默认 {}）。
                        服务端若设了 minClientVer/maxClientVer，必须对齐，否则握手会被拒。
+  --fingerprint <name> ClientHello 指纹 profile（默认 {}；可选：{}）。
+                       只改 TLS 外观，**不改 REALITY 认证**；未知名字会在这里直接报错
+                       并列出可用名字，不会静默回退。
+                       chrome 默认附带 ALPN h2, http/1.1（属于 profile 的一部分）。
+                       能力边界 / 已知不一致点见 docs/fingerprint-plan.md。
   --socks-user U --socks-pass P
                        启用 SOCKS5 用户名/密码认证。**监听非回环地址时强烈建议启用**，
                        否则就是开放代理。两者必须同时给出。
@@ -103,10 +120,14 @@ fn usage() -> ! {
   --no-flow            不发 XTLS-Vision flow 声明，也不做客户端侧 Vision 分帧。
                        **默认不需要**：本工程的服务端与官方 Xray 服务端都支持
                        Vision。只在「对端只认空 flow」或排障时才加。
+  --check              只做配置自检：打印生效的 fingerprint / alpn / no-flow /
+                       client-ver / server / listen（UUID 脱敏）后退出，不监听端口。
+                       与 `server --check` 对齐；未知 profile 名以非 0 退出。
 
 环境变量（命令行参数优先，便于 k8s 用 Secret 注入而不用写进 args）：
   XT_SERVER  XT_PBK  XT_SID  XT_SNI  XT_UUID  XT_LISTEN  XT_CLIENT_VER
-  XT_SOCKS_USER  XT_SOCKS_PASS  XT_HANDSHAKE_TIMEOUT  XT_NO_FLOW  XT_SELF_TEST
+  XT_FINGERPRINT  XT_SOCKS_USER  XT_SOCKS_PASS  XT_HANDSHAKE_TIMEOUT
+  XT_NO_FLOW  XT_SELF_TEST  XT_CHECK
 
 互操作（默认走 Vision；四种组合都必须能通）：
   wasm 客户端（默认）    →  wasm 服务端       ✅
@@ -115,6 +136,8 @@ fn usage() -> ! {
   wasm 客户端 --no-flow  →  官方 Xray 服务端  ✅
   未知 flow 名           →  任一服务端        ❌ 明确拒绝，不静默降级",
         version_string(RealityConfig::DEFAULT_CLIENT_VERSION),
+        xt_wasm_tls::fingerprint::DEFAULT_PROFILE_NAME,
+        profile_list(),
         DEFAULT_HANDSHAKE_TIMEOUT_SECS
     );
     std::process::exit(2)
@@ -160,6 +183,46 @@ fn version_string(v: [u8; 3]) -> String {
     format!("{}.{}.{}", v[0], v[1], v[2])
 }
 
+/// 可用 profile 名（供 `--help` 与报错文案）。
+///
+/// **从引擎取，不在 CLI 里手写第二份** —— 手写的清单一定会与 `fingerprint.rs`
+/// 漂移，而「报错里给的可用名字」是用户唯一能照着改的东西。
+fn profile_list() -> String {
+    xt_wasm_tls::fingerprint::profile_names().join(" / ")
+}
+
+/// 校验 `--fingerprint` / `XT_FINGERPRINT` 给的 profile 名。
+///
+/// 未知名字是**配置错误**：直接失败并列出可用名字。
+/// **绝不静默回退**到 `plain`（或任何别的 profile）—— 静默降级会让用户
+/// 以为自己开着伪装、其实没有，这类「看起来生效了」的故障最难排查。
+///
+/// 名字**大小写敏感**，不做别名猜测（与 `profile_by_name` 的精确匹配一致）。
+fn resolve_fingerprint(name: &str) -> String {
+    let names = xt_wasm_tls::fingerprint::profile_names();
+    if names.contains(&name) {
+        return name.to_string();
+    }
+    eprintln!(
+        "--fingerprint / XT_FINGERPRINT 不认识的 profile 名 {name:?}；可用：{}",
+        profile_list()
+    );
+    eprintln!("名字大小写敏感；不会静默回退到其它 profile。");
+    std::process::exit(2);
+}
+
+/// 自检输出里那行 ALPN：命令行没有独立的 `--alpn`，所以当下生效的就是
+/// profile 自带的默认值（`chrome` 为 `h2, http/1.1`；`plain` 不注入）。
+fn effective_alpn_note(name: &str) -> String {
+    match xt_wasm_tls::fingerprint::profile_by_name(name) {
+        Some(p) if p.default_alpn().is_empty() => {
+            "(profile 不注入默认；未显式配置则不发送)".to_string()
+        }
+        Some(p) => format!("{}（profile 默认）", p.default_alpn().join(", ")),
+        None => "(未知 profile)".to_string(),
+    }
+}
+
 /// 读一个环境变量；空串按「未设置」处理（k8s 里没填的字段常是空串）。
 pub(crate) fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
@@ -188,12 +251,16 @@ fn parse_args() -> Args {
     let mut sni = env_opt("XT_SNI");
     let mut uuid = env_opt("XT_UUID");
     let mut client_ver = env_opt("XT_CLIENT_VER");
+    // 空串按未设置处理（`env_opt` 已经过滤），所以 k8s 里 `XT_FINGERPRINT=""` 取默认。
+    let mut fingerprint = env_opt("XT_FINGERPRINT")
+        .unwrap_or_else(|| xt_wasm_tls::fingerprint::DEFAULT_PROFILE_NAME.to_string());
     let mut listen = env_opt("XT_LISTEN").unwrap_or_else(|| "127.0.0.1:1080".to_string());
     let mut socks_user = env_opt("XT_SOCKS_USER");
     let mut socks_pass = env_opt("XT_SOCKS_PASS");
     let mut handshake_timeout_secs = env_opt("XT_HANDSHAKE_TIMEOUT");
     let mut no_flow = env_flag("XT_NO_FLOW");
     let mut self_test = env_flag("XT_SELF_TEST");
+    let mut check = env_flag("XT_CHECK");
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -211,12 +278,14 @@ fn parse_args() -> Args {
             "--sni" => sni = Some(need(i)),
             "--uuid" => uuid = Some(need(i)),
             "--client-ver" => client_ver = Some(need(i)),
+            "--fingerprint" => fingerprint = need(i),
             "--listen" => listen = need(i),
             "--socks-user" => socks_user = Some(need(i)),
             "--socks-pass" => socks_pass = Some(need(i)),
             "--handshake-timeout" => handshake_timeout_secs = Some(need(i)),
             "--no-flow" => no_flow = true,
             "--self-test" => self_test = true,
+            "--check" => check = true,
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("未知参数：{other}");
@@ -224,7 +293,7 @@ fn parse_args() -> Args {
             }
         }
         // 不带取值的开关不能多吃一个参数，否则会把后面的 flag 吞掉。
-        i += if matches!(argv[i].as_str(), "--self-test" | "--no-flow") {
+        i += if matches!(argv[i].as_str(), "--self-test" | "--no-flow" | "--check") {
             1
         } else {
             2
@@ -265,6 +334,9 @@ fn parse_args() -> Args {
         client_version: client_ver
             .map(|s| parse_version(&s))
             .unwrap_or(RealityConfig::DEFAULT_CLIENT_VERSION),
+        // 名字在这里就校验：未知名字到此为止，绝不带着一个拼错的名字继续启动。
+        fingerprint: resolve_fingerprint(&fingerprint),
+        check,
         sni,
         uuid: uuid.unwrap_or_default(),
         listen,
@@ -451,8 +523,16 @@ fn main() {
             client_version: args.client_version,
             ..RealityConfig::new(args.public_key, args.short_id)
         }),
+        // `Some(name)`：名字已在 parse_args 里校验过（未知名字到不了这里）。
+        // 取 `Some` 而不是 `None`（`None` 也等价于默认 profile），是为了让
+        // 「用户到底配了什么」在自检输出里是可区分的。
+        fingerprint: Some(args.fingerprint.clone()),
         ..TlsConfig::new(&args.sni)
     };
+
+    if args.check {
+        run_check(&args, &tls);
+    }
 
     if args.self_test {
         run_self_test(&args, &tls);
@@ -588,11 +668,12 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
         eprintln!("──────────────────────────────────────────────────────────────");
     }
     println!(
-        "[socks5] 监听 {}，隧道目标 {}，认证：{}，并发上限 {}",
+        "[socks5] 监听 {}，隧道目标 {}，认证：{}，并发上限 {}，ClientHello profile：{}",
         args.listen,
         args.server,
         if has_auth { "用户名/密码" } else { "无" },
-        MAX_CONCURRENT_CONNS
+        MAX_CONCURRENT_CONNS,
+        args.fingerprint
     );
     println!(
         "[socks5] 用法： curl --proxy socks5h://{} https://example.com",
@@ -683,6 +764,52 @@ async fn serve_inner(mut stream: NetStream, shared: &Shared) -> Result<(String, 
         .map_err(|e| format!("转发失败：{e}"))?;
 
     Ok((host, port))
+}
+
+/// 客户端配置自检（`--check` / `XT_CHECK=1`）：打印**生效**配置后退出，不监听端口。
+///
+/// 与 `server --check` 同一用途（k8s 排障：确认 Pod 里实际生效的是哪套配置），
+/// 但客户端多一条关键信息 —— **生效的 ClientHello profile 与 ALPN**。
+/// 指纹配错时最大的风险不是报错，而是「用户以为在伪装、其实退回了另一个形状」，
+/// 所以这里把最终生效值摊开打印。
+///
+/// 输出里不写「已启用 Chrome 伪装」这类结论性措辞：像不像由
+/// `docs/fingerprint-plan.md` 的对拍判据说话，自检只报**配置值**。
+///
+/// ⚠️ wasmtime 会把 guest 退出码塌缩成 0 / 非 0，脚本不要断言 `== 2`。
+fn run_check(args: &Args, tls: &TlsConfig) -> ! {
+    println!("[check] 客户端生效配置：");
+    println!("[check] fingerprint = {}", args.fingerprint);
+    println!(
+        "[check] alpn        = {}",
+        effective_alpn_note(&args.fingerprint)
+    );
+    println!("[check] no-flow     = {}", args.no_flow);
+    println!(
+        "[check] client-ver  = {}",
+        version_string(args.client_version)
+    );
+    println!("[check] server      = {}", args.server);
+    println!("[check] sni         = {}", args.sni);
+    println!("[check] listen      = {}", args.listen);
+    // 自检输出常被贴进工单，所以只报「有没有配」，不打印 UUID 本身。
+    println!(
+        "[check] uuid        = {}",
+        if args.uuid.is_empty() {
+            "未设置（仅 --self-test 需要）"
+        } else {
+            "已设置（脱敏，不打印）"
+        }
+    );
+
+    // 走一遍 REALITY 层的构造，让「配置类错误」（例如 reality-opts 与 ech-opts
+    // 同时出现）也在自检里暴露，而不是等到真的拨号时才发现。
+    if let Err(e) = RealityTlsLayer::new(tls) {
+        eprintln!("[check] ✗ 配置不合法：{e}");
+        std::process::exit(2);
+    }
+    println!("[check] ✓ 配置自检通过（未监听任何端口）");
+    std::process::exit(0)
 }
 
 /// M1 验收：只做 REALITY 握手，证明 TLS 1.3 + REALITY 认证在 wasm 里成立。
@@ -936,6 +1063,64 @@ mod tests {
         assert!(
             v[0] >= 24,
             "默认 ClientVer {v:?} 过旧，会被设置了 minClientVer 的服务端判为探测流量"
+        );
+    }
+
+    // ───────────────── ClientHello 指纹 profile 的配置面 ─────────────────
+
+    /// 默认 profile 名必须真的存在于引擎里 ——
+    /// 否则用户什么都不配就会启动失败（最坏的一种发布事故）。
+    #[test]
+    fn default_fingerprint_name_resolves_in_engine() {
+        let name = xt_wasm_tls::fingerprint::DEFAULT_PROFILE_NAME;
+        let p = xt_wasm_tls::fingerprint::profile_by_name(name)
+            .unwrap_or_else(|| panic!("默认 profile {name:?} 在引擎里查不到"));
+        assert_eq!(p.name(), name);
+        // 合法名字原样返回（只有未知名字才会 exit，无法在单测里断言退出码）。
+        assert_eq!(resolve_fingerprint(name), name);
+    }
+
+    /// `--help` / 报错文案里的可选列表直接来自引擎：非空、无重复、每个都能解析，
+    /// 且含默认名。手写清单会漂移，这条用例就是防漂移的钉子。
+    #[test]
+    fn profile_names_from_engine_are_consistent() {
+        let names = xt_wasm_tls::fingerprint::profile_names();
+        assert!(!names.is_empty(), "profile 清单不能为空");
+        for (i, n) in names.iter().enumerate() {
+            assert!(
+                xt_wasm_tls::fingerprint::profile_by_name(n).is_some(),
+                "清单里的 {n:?} 无法被 profile_by_name 解析"
+            );
+            assert!(!names[..i].contains(n), "清单里 {n:?} 重复");
+        }
+        assert!(
+            names.contains(&xt_wasm_tls::fingerprint::DEFAULT_PROFILE_NAME),
+            "清单里必须含默认名字"
+        );
+    }
+
+    /// 名字**大小写敏感、不猜**：`Chrome` / 空串都当未知名字。
+    /// （未知名字会走 `resolve_fingerprint` 的 exit 路径，所以这里只测引擎语义。）
+    #[test]
+    fn fingerprint_names_are_case_sensitive_and_not_aliased() {
+        assert!(xt_wasm_tls::fingerprint::profile_by_name("Chrome").is_none());
+        assert!(xt_wasm_tls::fingerprint::profile_by_name("CHROME").is_none());
+        assert!(xt_wasm_tls::fingerprint::profile_by_name("").is_none());
+        assert!(xt_wasm_tls::fingerprint::profile_by_name("none").is_none());
+    }
+
+    /// 自检要能报出生效 ALPN：默认 profile 自带 `h2, http/1.1`（它属于 profile
+    /// 的一部分 —— 空 ALPN 会让 JA4 与真 Chrome 不等）。
+    #[test]
+    fn check_output_reports_profile_default_alpn() {
+        let note = effective_alpn_note(xt_wasm_tls::fingerprint::DEFAULT_PROFILE_NAME);
+        assert!(
+            note.contains("h2"),
+            "自检里的 alpn 应包含 h2，实际 {note:?}"
+        );
+        assert!(
+            note.contains("http/1.1"),
+            "自检里的 alpn 应包含 http/1.1，实际 {note:?}"
         );
     }
 }

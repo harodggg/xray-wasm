@@ -35,7 +35,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
     config::{RealityConfig, TlsConfig},
-    Result, Stream, Transport, TransportError,
+    fingerprint, Result, Stream, Transport, TransportError,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -111,6 +111,12 @@ pub struct RealityTlsLayer {
     server_name: String,
     alpn: Vec<String>,
     reality: RealityConfig,
+    /// ClientHello 指纹 profile。
+    ///
+    /// 来自 `TlsConfig.fingerprint`（YAML 的 `client-fingerprint:`，CLI 的
+    /// `--fingerprint`），在 [`RealityTlsLayer::new`] 里就解析并**定死**：
+    /// 未知名字当场返回配置错误，运行期不接受任何远端输入改变它。
+    profile: &'static fingerprint::Profile,
 }
 
 impl RealityTlsLayer {
@@ -145,11 +151,21 @@ impl RealityTlsLayer {
             );
         }
 
+        // 指纹 profile 在**构造期**解析：名字不认识就在这里失败，而不是等到
+        // 第一次握手才静默用一个别的形状发出去。
+        let profile = resolve_profile(config.fingerprint.as_deref())?;
+
         Ok(Self {
             server_name,
             alpn: config.alpn.clone(),
             reality,
+            profile,
         })
+    }
+
+    /// 本层实际使用的指纹 profile 名。用于自检/日志（不参与握手逻辑）。
+    pub fn fingerprint_profile_name(&self) -> &'static str {
+        self.profile.name()
     }
 }
 
@@ -184,11 +200,12 @@ where
 #[async_trait::async_trait]
 impl Transport for RealityTlsLayer {
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
-        let stream = handshake_with_deadline(reality_handshake(
+        let stream = handshake_with_deadline(reality_handshake_with_profile(
             inner,
             &self.server_name,
             &self.alpn,
             &self.reality,
+            self.profile,
         ))
         .await?;
         Ok(Box::new(stream))
@@ -205,10 +222,33 @@ impl Transport for RealityTlsLayer {
 /// No timeout is applied here (matching upstream, which applied it in the
 /// layer); the caller enforces its own deadline.
 pub async fn reality_handshake(
+    inner: Box<dyn Stream>,
+    server_name: &str,
+    alpn: &[String],
+    reality: &RealityConfig,
+) -> Result<RealityTlsStream> {
+    // 这个原语**固定用 `plain` 形状**（= 本仓库历史上一直发的那个最小
+    // ClientHello），以便所有既有调用方与测试的线上字节不变。
+    //
+    // 想伪装成浏览器形状，走两条路之一：
+    //   * [`RealityTlsLayer`]（读 `TlsConfig.fingerprint`，默认 `chrome`）——
+    //     生产路径 / CLI 走的就是它；
+    //   * [`reality_handshake_with_profile`]（显式指定 profile）。
+    let plain = fingerprint::profile_by_name("plain").expect("内置 plain profile 必须存在");
+    reality_handshake_with_profile(inner, server_name, alpn, reality, plain).await
+}
+
+/// 同 [`reality_handshake`]，但显式指定 ClientHello 指纹 profile。
+///
+/// REALITY 认证语义与 [`reality_handshake`] **逐字节相同**：profile 只改
+/// ClientHello 的「外观」（cipher 列表、扩展集合与顺序、GREASE、ECH 占位…），
+/// 不改认证依赖的两个位置 —— random（偏移 6..38）与 session_id（偏移 39..71）。
+pub async fn reality_handshake_with_profile(
     mut inner: Box<dyn Stream>,
     server_name: &str,
     alpn: &[String],
     reality: &RealityConfig,
+    profile: &fingerprint::Profile,
 ) -> Result<RealityTlsStream> {
     let mut client_private = rand::random::<[u8; 32]>();
     clamp_x25519_private(&mut client_private);
@@ -216,7 +256,8 @@ pub async fn reality_handshake(
     let auth_key = x25519(&client_private, &reality.public_key)?;
 
     let mut client_random = rand::random::<[u8; 32]>();
-    let (client_hello, reality_auth_key) = build_reality_client_hello(
+    let (client_hello, reality_auth_key) = build_reality_client_hello_with_profile(
+        profile,
         server_name,
         alpn,
         &client_random,
@@ -668,6 +709,41 @@ fn transport_io_error(e: TransportError) -> io::Error {
     io::Error::other(e)
 }
 
+/// 解析 `--fingerprint` / `TlsConfig.fingerprint` 给出的 profile 名。
+///
+/// * `None` / `""` → 默认 profile（`chrome`）；
+/// * 认不出的名字 → [`TransportError::Config`]，**绝不静默回退**。
+///
+/// 静默回退是这类特性里最坏的一种失败：用户以为自己伪装了，实际发出去的
+/// 还是最容易被识别的形状，而且没有任何日志能看出来。名字严格按原样匹配
+/// （不做大小写折叠、不做 trim），与 `fingerprint::profile_by_name` 一致。
+pub(crate) fn resolve_profile(name: Option<&str>) -> Result<&'static fingerprint::Profile> {
+    match name {
+        None | Some("") => Ok(default_profile()),
+        Some(name) => fingerprint::profile_by_name(name).ok_or_else(|| {
+            TransportError::Config(format!(
+                "未知的 ClientHello 指纹 profile「{name}」；可用：{}（省略或留空则用 {}）",
+                fingerprint::profile_names().join(" / "),
+                fingerprint::DEFAULT_PROFILE_NAME
+            ))
+        }),
+    }
+}
+
+/// 默认 profile（`fingerprint::DEFAULT_PROFILE_NAME`）。
+fn default_profile() -> &'static fingerprint::Profile {
+    fingerprint::profile_by_name(fingerprint::DEFAULT_PROFILE_NAME)
+        .expect("内置默认 profile 必须存在")
+}
+
+/// 用 `plain` profile 构造 REALITY 客户端 ClientHello。
+///
+/// 保留这个签名是为了让既有调用方/测试的线上字节**一个都不变**：`plain`
+/// 形状与改造前手写的那段逐字节相同（单测 `plain_shape_is_pinned` 钉住）。
+///
+/// 生产路径不直接调它（走 [`reality_handshake_with_profile`]），它只为既有
+/// 测试保留；`plain` 生产路径由 [`reality_handshake`] 走 profile 版实现。
+#[cfg(test)]
 pub(crate) fn build_reality_client_hello(
     server_name: &str,
     alpn: &[String],
@@ -676,47 +752,73 @@ pub(crate) fn build_reality_client_hello(
     auth_key: &[u8; 32],
     reality: &RealityConfig,
 ) -> Result<(Vec<u8>, [u8; 32])> {
-    let mut body = Vec::with_capacity(512);
-    body.extend_from_slice(&[0x03, 0x03]);
-    body.extend_from_slice(random);
-    body.push(32);
-    body.extend_from_slice(&[0u8; 32]);
+    let plain = fingerprint::profile_by_name("plain").expect("内置 plain profile 必须存在");
+    build_reality_client_hello_with_profile(
+        plain,
+        server_name,
+        alpn,
+        random,
+        key_share,
+        auth_key,
+        reality,
+    )
+}
 
-    let ciphers = [TLS_AES_128_GCM_SHA256];
-    put_u16((ciphers.len() * 2) as u16, &mut body);
-    for cipher in ciphers {
-        put_u16(cipher, &mut body);
+/// 按给定 profile 构造 REALITY 客户端 ClientHello，并完成 REALITY 认证封装。
+///
+/// 返回 `(handshake 消息, AEAD key)`。
+///
+/// # profile 只改外观，不改认证
+///
+/// 组装交给 [`fingerprint::build_client_hello`]；REALITY 的两处语义在这里
+/// 原样保留，与改造前逐字一致：
+///
+/// * HKDF 的输入是 handshake 消息的 **random 字段**（偏移 `6..38`，取前 20 字节）；
+/// * AEAD 的 AAD 是**整条 handshake 消息**（此时 session_id 区是全零占位），
+///   算完之后把 16 字节密文 + 16 字节 tag 写回 **偏移 `39..71`**；
+/// * nonce 取 `random[20..32]`。
+///
+/// 正因为 AAD 覆盖整条消息，「改 profile」会改变 AAD —— 所以密文必须**先拼好
+/// 形状、后算认证**（下面的顺序不能调换）。服务端那边同样把 session_id 区
+/// 视为占位来重算 AAD，所以两侧一致。
+pub(crate) fn build_reality_client_hello_with_profile(
+    profile: &fingerprint::Profile,
+    server_name: &str,
+    alpn: &[String],
+    random: &[u8; 32],
+    key_share: &[u8; 32],
+    auth_key: &[u8; 32],
+    reality: &RealityConfig,
+) -> Result<(Vec<u8>, [u8; 32])> {
+    // session_id 区先放全零：它就是 AAD 的一部分，最后由本函数写回密文。
+    // GREASE 种子每连接取一次 CSPRNG（扩展顺序、GREASE 值、ECH 填充长度都跟着它变）。
+    let mut hello = fingerprint::build_client_hello(
+        profile,
+        server_name,
+        alpn,
+        random,
+        &[0u8; 32],
+        key_share,
+        fingerprint::new_grease_seed(),
+    )
+    .map_err(|e| {
+        TransportError::Config(format!(
+            "ClientHello 指纹组装失败（profile={}）：{e}",
+            profile.name()
+        ))
+    })?;
+
+    // ── 偏移契约硬校验 ──
+    //
+    // 引擎改了布局而这里没跟上，症状会是「服务端解不开 session_id」这种远端
+    // 才看得见的失败。宁可在这里直接报错。
+    if hello.len() < 71 || hello[38] != 32 || hello[6..38] != random[..] {
+        return Err(TransportError::Tls(format!(
+            "指纹引擎破坏了 ClientHello 偏移契约：len={}，session_id_len={}",
+            hello.len(),
+            hello.get(38).copied().unwrap_or(0)
+        )));
     }
-    body.extend_from_slice(&[1, 0]);
-
-    let mut exts = Vec::new();
-    push_ext(&mut exts, 0, &server_name_ext(server_name)?);
-    push_ext(
-        &mut exts,
-        10,
-        &u16_list_ext(&[GROUP_X25519, 0x0017, 0x0018]),
-    );
-    push_ext(&mut exts, 11, &[1, 0]);
-    push_ext(
-        &mut exts,
-        13,
-        &u16_list_ext(&[0x0807, 0x0403, 0x0804, 0x0805]),
-    );
-    if !alpn.is_empty() {
-        push_ext(&mut exts, 16, &alpn_ext(alpn)?);
-    }
-    push_ext(&mut exts, 35, &[]);
-    push_ext(&mut exts, 43, &[4, 0x03, 0x04, 0x03, 0x03]);
-    push_ext(&mut exts, 45, &[1, 1]);
-    push_ext(&mut exts, 51, &key_share_ext(key_share));
-
-    put_u16(exts.len() as u16, &mut body);
-    body.extend_from_slice(&exts);
-
-    let mut hello = Vec::with_capacity(4 + body.len());
-    hello.push(HS_CLIENT_HELLO);
-    put_u24(body.len(), &mut hello);
-    hello.extend_from_slice(&body);
 
     let auth_key = hkdf_sha256(auth_key, &hello[4 + 2..4 + 2 + 20], b"REALITY", 32);
     let mut aead_key = [0u8; 32];
@@ -759,60 +861,7 @@ pub(crate) fn build_reality_client_hello(
     Ok((hello, aead_key))
 }
 
-fn server_name_ext(server_name: &str) -> Result<Vec<u8>> {
-    if server_name.len() > u16::MAX as usize {
-        return Err(TransportError::Config("SNI is too long".into()));
-    }
-    let mut name = Vec::new();
-    name.push(0);
-    put_u16(server_name.len() as u16, &mut name);
-    name.extend_from_slice(server_name.as_bytes());
-
-    let mut out = Vec::new();
-    put_u16(name.len() as u16, &mut out);
-    out.extend_from_slice(&name);
-    Ok(out)
-}
-
-fn alpn_ext(alpn: &[String]) -> Result<Vec<u8>> {
-    let mut list = Vec::new();
-    for protocol in alpn {
-        let bytes = protocol.as_bytes();
-        if bytes.len() > u8::MAX as usize {
-            return Err(TransportError::Config(format!(
-                "ALPN protocol id '{protocol}' is too long"
-            )));
-        }
-        list.push(bytes.len() as u8);
-        list.extend_from_slice(bytes);
-    }
-    let mut out = Vec::new();
-    put_u16(list.len() as u16, &mut out);
-    out.extend_from_slice(&list);
-    Ok(out)
-}
-
-fn u16_list_ext(values: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + values.len() * 2);
-    put_u16((values.len() * 2) as u16, &mut out);
-    for value in values {
-        put_u16(*value, &mut out);
-    }
-    out
-}
-
-fn key_share_ext(public_key: &[u8; 32]) -> Vec<u8> {
-    let mut entry = Vec::with_capacity(4 + public_key.len());
-    put_u16(GROUP_X25519, &mut entry);
-    put_u16(public_key.len() as u16, &mut entry);
-    entry.extend_from_slice(public_key);
-
-    let mut out = Vec::with_capacity(2 + entry.len());
-    put_u16(entry.len() as u16, &mut out);
-    out.extend_from_slice(&entry);
-    out
-}
-
+#[cfg(test)]
 fn push_ext(out: &mut Vec<u8>, typ: u16, data: &[u8]) {
     put_u16(typ, out);
     put_u16(data.len() as u16, out);
@@ -1046,7 +1095,9 @@ impl ServerFlightGuard {
         }
         match msg.typ {
             HS_ENCRYPTED_EXTENSIONS => {
-                if self.saw_encrypted_extensions || self.saw_certificate || self.saw_certificate_verify
+                if self.saw_encrypted_extensions
+                    || self.saw_certificate
+                    || self.saw_certificate_verify
                 {
                     return Err(TransportError::Tls(
                         "Reality TLS: unexpected EncryptedExtensions in server flight".into(),
@@ -1055,7 +1106,9 @@ impl ServerFlightGuard {
                 self.saw_encrypted_extensions = true;
             }
             HS_CERTIFICATE => {
-                if !self.saw_encrypted_extensions || self.saw_certificate || self.saw_certificate_verify
+                if !self.saw_encrypted_extensions
+                    || self.saw_certificate
+                    || self.saw_certificate_verify
                 {
                     return Err(TransportError::Tls(
                         "Reality TLS: unexpected Certificate in server flight".into(),
@@ -1541,6 +1594,254 @@ mod tests {
         assert_eq!(hello[0], HS_CLIENT_HELLO);
         assert_eq!(hello[38], 32);
         assert_ne!(&hello[39..71], &[0u8; 32]);
+    }
+
+    /// 从 ClientHello 里取出扩展类型列表（顺序即线上顺序）。
+    fn parse_extension_types(hello: &[u8]) -> Vec<u16> {
+        let mut p = 4 + 2 + 32; // handshake 头 + legacy_version + random
+        let sid = hello[p] as usize;
+        p += 1 + sid;
+        let cs = u16::from_be_bytes([hello[p], hello[p + 1]]) as usize;
+        p += 2 + cs;
+        let cm = hello[p] as usize;
+        p += 1 + cm;
+        let ext_len = u16::from_be_bytes([hello[p], hello[p + 1]]) as usize;
+        p += 2;
+        let end = p + ext_len;
+        let mut out = Vec::new();
+        while p + 4 <= end {
+            let typ = u16::from_be_bytes([hello[p], hello[p + 1]]);
+            let len = u16::from_be_bytes([hello[p + 2], hello[p + 3]]) as usize;
+            out.push(typ);
+            p += 4 + len;
+        }
+        out
+    }
+
+    fn is_grease(v: u16) -> bool {
+        v & 0x0f0f == 0x0a0a
+    }
+
+    /// `plain` 形状必须**逐字节稳定**。
+    ///
+    /// 这是指纹特性改造前的线上形状，也是所有选 `plain`（不想伪装）的用户的
+    /// 形状。这条把「引擎的 plain profile 与旧手写代码逐字节相同」钉死，防止
+    /// 将来有人在引擎里顺手改动 plain 而没人发现。
+    ///
+    /// session_id 区（`39..71`）装的是「当前时间戳 + shortId」的 AEAD 密文，
+    /// 天然逐次不同，所以只比对**除 session_id 以外**的全部字节。
+    #[test]
+    fn plain_shape_is_pinned() {
+        let reality = RealityConfig::new([9u8; 32], [1, 2, 3, 4, 5, 6, 7, 8]);
+        let (hello, _) = build_reality_client_hello(
+            "example.com",
+            &[],
+            &[7u8; 32],
+            &[3u8; 32],
+            &[5u8; 32],
+            &reality,
+        )
+        .expect("plain client hello");
+
+        assert_eq!(hello.len(), 192, "plain 形状的体量也是基准的一部分");
+        let mut shape = hello[..39].to_vec();
+        shape.extend_from_slice(&hello[71..]);
+        let hex: String = shape.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, PLAIN_SHAPE_HEX,
+            "plain 形状变了 —— 这是线上字节的回归基准，改它必须是有意的"
+        );
+        // 认证确实写进了 session_id 区（不是留了 32 个零）
+        assert_ne!(&hello[39..71], &[0u8; 32]);
+    }
+
+    /// chrome 形状的 ClientHello **必须仍能被我们自己的服务端认证通过**。
+    ///
+    /// 指纹只改外观：REALITY 的 HKDF 输入（`random` 字段）与 session_id 密文
+    /// 位置都不能被 profile 改动。这条是**真握手级**的证据 —— 光有形状断言
+    /// （`chrome_profile_wire_hello_is_browser_shaped`）证明不了认证还活着。
+    #[test]
+    fn chrome_client_hello_authenticates_against_our_server() {
+        use crate::reality_server::{authenticate, parse_client_hello, RealityServerConfig};
+
+        const SNI: &str = "www.cloudflare.com";
+        const SHORT_ID: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44];
+
+        let server_priv = crate::test_support::fixture_private_key();
+        let server_pub = crate::test_support::public_from_private(&server_priv);
+
+        let mut client_priv = [0x17u8; 32];
+        clamp_x25519_private(&mut client_priv);
+        let client_pub = x25519_public_from_private(&client_priv);
+        let shared = x25519(&client_priv, &server_pub).expect("x25519 共享密钥");
+
+        let reality = RealityConfig::new(server_pub, SHORT_ID);
+        let chrome = fingerprint::profile_by_name("chrome").expect("chrome profile");
+        let (hello, _) = build_reality_client_hello_with_profile(
+            chrome,
+            SNI,
+            &[],
+            &[0x5au8; 32],
+            &client_pub,
+            &shared,
+            &reality,
+        )
+        .expect("chrome client hello");
+
+        // 服务端侧：解析 + 认证（用的是生产同一条路径）
+        let ch = parse_client_hello(&hello).expect("服务端必须能解析 chrome 形状");
+        assert_eq!(ch.server_name.as_deref(), Some(SNI));
+        assert_eq!(
+            ch.key_share, client_pub,
+            "key_share 必须仍被正确挑出（chrome 的 key_share 首项是 GREASE）"
+        );
+
+        let cfg = RealityServerConfig {
+            private_key: server_priv,
+            short_ids: vec![SHORT_ID],
+            server_names: vec![SNI.to_string()],
+            max_time_diff_secs: 60,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let auth = authenticate(&ch, &cfg, now).expect("chrome 形状必须能认证通过");
+        assert_eq!(auth.short_id, SHORT_ID, "shortId 应被还原");
+        assert_eq!(auth.client_version, reality.client_version);
+    }
+
+    /// **层构造期就要拒绝未知 profile 名**（不是等到第一次握手才失败）。
+    ///
+    /// 这是 CLI 真正走的路径：`TlsConfig.fingerprint` → [`RealityTlsLayer::new`]。
+    /// 未知名字必须返回配置错误并列出可用名字；`""` 表示用默认（`chrome`）。
+    #[test]
+    fn layer_rejects_unknown_fingerprint_at_construction() {
+        fn cfg(fingerprint: Option<&str>) -> TlsConfig {
+            TlsConfig {
+                reality: Some(RealityConfig::new(
+                    crate::test_support::public_from_private(
+                        &crate::test_support::fixture_private_key(),
+                    ),
+                    [1, 2, 3, 4, 5, 6, 7, 8],
+                )),
+                fingerprint: fingerprint.map(str::to_string),
+                ..TlsConfig::new("www.cloudflare.com")
+            }
+        }
+
+        // 默认与空串 → 默认 profile
+        assert_eq!(
+            RealityTlsLayer::new(&cfg(None))
+                .expect("默认")
+                .fingerprint_profile_name(),
+            fingerprint::DEFAULT_PROFILE_NAME
+        );
+        assert_eq!(
+            RealityTlsLayer::new(&cfg(Some("")))
+                .expect("空串=默认")
+                .fingerprint_profile_name(),
+            fingerprint::DEFAULT_PROFILE_NAME
+        );
+        assert_eq!(
+            RealityTlsLayer::new(&cfg(Some("plain")))
+                .expect("plain")
+                .fingerprint_profile_name(),
+            "plain"
+        );
+
+        // 未知名字：构造即失败，错误里带名字与可用清单
+        for bad in ["safari", "Chrome", "chrome-latest", "Chrome "] {
+            let Err(err) = RealityTlsLayer::new(&cfg(Some(bad))) else {
+                panic!("未知 profile 名 {bad:?} 必须在构造期报错");
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains(bad), "错误要点出名字：{msg}");
+            assert!(
+                msg.contains("chrome") && msg.contains("plain"),
+                "错误要列出可用名字：{msg}"
+            );
+        }
+    }
+
+    /// 改造前 `plain` 的线上形状（`hello[..39] ++ hello[71..]`），
+    /// 由 `build_reality_client_hello("example.com", &[], [7;32], [3;32], [5;32], …)` 产出。
+    const PLAIN_SHAPE_HEX: &str = "010000bc0303070707070707070707070707070707070707070707070707070707070707070720000213010100007100000010000e00000b6578616d706c652e636f6d000a00080006001d00170018000b00020100000d000a0008080704030804080500230000002b00050403040303002d00020101003300260024001d00200303030303030303030303030303030303030303030303030303030303030303";
+
+    /// 默认 profile 是 `chrome`；名字解析**严格**（不折叠大小写、不 trim），
+    /// 未知名字必须报错并列出可用名字 —— 绝不静默回退到 plain。
+    ///
+    /// 静默回退是这类特性最坏的失败：用户以为在伪装，实际发的是最容易被识别
+    /// 的形状，而且日志里看不出任何异常。
+    #[test]
+    fn profile_resolution_defaults_to_chrome_and_rejects_unknown() {
+        assert_eq!(resolve_profile(None).unwrap().name(), "chrome");
+        assert_eq!(resolve_profile(Some("")).unwrap().name(), "chrome");
+        assert_eq!(resolve_profile(Some("chrome")).unwrap().name(), "chrome");
+        assert_eq!(resolve_profile(Some("plain")).unwrap().name(), "plain");
+
+        for bad in ["Chrome", "CHROME", "chrome ", " safari", "safari", "none"] {
+            // `Profile` 没实现 Debug，所以不用 `expect_err`。
+            let Err(err) = resolve_profile(Some(bad)) else {
+                panic!("未知 profile 名 {bad:?} 必须报错，不能静默回退");
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains(bad), "错误里要点出给的名字：{msg}");
+            assert!(
+                msg.contains("chrome") && msg.contains("plain"),
+                "错误里要列出可用名字：{msg}"
+            );
+        }
+    }
+
+    /// **行为级回归守卫**：走 profile 版构建器出来的 chrome ClientHello
+    /// 必须真的是浏览器形状。
+    ///
+    /// 这是 testing 的「真机探针」在单元层的对应物 —— 它盯的不是引擎自己的
+    /// 对拍（那测的是纯函数），而是**接线用没用上引擎**：曾经出现过引擎全绿、
+    /// 生产路径却仍在手写最小 ClientHello 的情况（真机探针抓到）。
+    #[test]
+    fn chrome_profile_wire_hello_is_browser_shaped() {
+        let reality = RealityConfig::new([9u8; 32], [1, 2, 3, 4, 5, 6, 7, 8]);
+        let chrome = fingerprint::profile_by_name("chrome").expect("chrome profile");
+        let random = [7u8; 32];
+        let (hello, _) = build_reality_client_hello_with_profile(
+            chrome,
+            "example.com",
+            &[],
+            &random,
+            &[3u8; 32],
+            &[5u8; 32],
+            &reality,
+        )
+        .expect("chrome client hello");
+
+        let exts = parse_extension_types(&hello);
+        assert_eq!(exts.len(), 18, "chrome 形状应有 18 个扩展：{exts:04x?}");
+        assert!(exts.contains(&0xfe0d), "缺 GREASE ECH 占位：{exts:04x?}");
+        assert!(exts.contains(&0x44cd), "缺 ALPS：{exts:04x?}");
+        assert!(exts.contains(&16), "缺 ALPN：{exts:04x?}");
+        assert!(
+            is_grease(exts[0]) && is_grease(exts[exts.len() - 1]),
+            "首尾扩展必须是 GREASE：{exts:04x?}"
+        );
+        assert!(
+            !exts.contains(&0x11ec),
+            "绝不声明 X25519MLKEM768（我们给不出它的 key_share，对端会回 HRR）"
+        );
+        assert!(
+            hello.windows(8).any(|w| w == b"http/1.1"),
+            "chrome 默认必须带 ALPN h2/http1.1"
+        );
+        // 偏移契约与认证
+        assert_eq!(&hello[6..38], &random);
+        assert_eq!(hello[38], 32);
+        assert_ne!(&hello[39..71], &[0u8; 32], "session_id 必须已写入认证密文");
+        assert!(
+            hello.len() > 400,
+            "chrome 形状体量应远超 plain(192)，实得 {}",
+            hello.len()
+        );
     }
 
     #[test]

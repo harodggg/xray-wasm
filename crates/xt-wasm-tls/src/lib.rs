@@ -30,6 +30,14 @@ mod config;
 mod reality;
 mod reality_server;
 
+/// ClientHello 指纹 profile 引擎（浏览器形状伪装）。
+///
+/// 独立成模块是为了能被**单独对拍**：`tests/fingerprint_differential.rs`
+/// 直接调 [`fingerprint::build_client_hello`]，与仓库里那份真实抓到的官方
+/// 客户端 ClientHello 逐字段比对。`reality.rs` 只负责把它的输出接进握手，
+/// 不重复实现任何字节布局。
+pub mod fingerprint;
+
 pub use config::{ClientCert, EchOpts, RealityConfig, TlsConfig};
 pub use reality::{reality_handshake, RealityTlsLayer, RealityTlsStream};
 pub use reality_server::{

@@ -499,7 +499,7 @@ pub async fn reality_server_handshake(
                 stream: inner,
                 buffered,
                 server_name: None,
-            })
+            });
         }
     };
 
@@ -515,7 +515,7 @@ pub async fn reality_server_handshake(
                 stream: inner,
                 buffered,
                 server_name: ch.server_name.clone(),
-            })
+            });
         }
     };
 

@@ -79,6 +79,21 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 > 所以**默认不用加 `--no-flow`**：本工程的服务端与官方 Xray 服务端都支持 Vision。
 > 它只在「对端只认空 flow」或排障时才需要。
 
+> **ClientHello 外观（默认）**：本工程 wasm 客户端默认组装**一个有版本年代的 Chrome 形状**
+> 的 ClientHello（`--fingerprint chrome`），等价于「**PQ 尚未默认开启的 Chrome（约 Chrome 114）**」，
+> **不是**当前最新 Chrome。它只做到「**可观测字段**一致」（legacy_version / cipher 列表 /
+> 扩展集合与顺序 / `ec_point_formats` / ALPN / `sigalgs` / GREASE 模式 / compression），
+> **不等于「实现了 Chrome 指纹」**。与当前 Chrome 的差异只有一处、但无法弥补：
+> 当前 Chrome 声明 X25519MLKEM768(11ec) 并带它的 `key_share`，我们**两者都不发** ——
+> 因为声明 11ec 却不给 key_share 会触发 HelloRetryRequest（T4 实测 5/5），
+> 而本工程不支持 HRR ⇒ 握手直接失败。真实 ECH 也只发 GREASE 占位。
+> 可计算的判据是 **JA4**：我们的 chrome 输出与官方夹包 **JA4 全等**
+> （`t13d1516h2_8daaf6152771_d8a2da3f94cd`，T3 实测）；**JA3 必然不同**
+> （真 Chrome 自己的 JA3 每次连接都不一样）。另有一条真实代价：我们只做**纯 X25519**，
+> 没有真 Chrome 的后量子混合，**缺少抗「先存后解」保护**。
+> 已知不一致点与代价见 [`docs/fingerprint-plan.md`](docs/fingerprint-plan.md) 与
+> [`docs/fingerprint-security.md`](docs/fingerprint-security.md)。
+
 **必须记住的三条硬约束**（违反任一条都会得到一个「看起来在跑但不可用」的服务端）：
 
 1. **`flow` 可以照官方写法填 `xtls-rprx-vision`。** 服务端的 XTLS-Vision
@@ -156,7 +171,7 @@ XW_XRAY_DIR=$PWD/.test-server ./scripts/e2e-test.sh
 
 ```
 xt-wasm-cli --self-test --server <ip:port> --pbk <base64url> --sid <hex> --sni <域名>
-xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid> [--listen 127.0.0.1:1080]
+xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid> [--listen 127.0.0.1:1080] [--fingerprint chrome]
 ```
 
 | 参数 | 环境变量 | 必填 | 默认 | 说明 |
@@ -172,6 +187,8 @@ xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid>
 | `--handshake-timeout` | `XT_HANDSHAKE_TIMEOUT` | | `15` | 协商阶段读超时（秒） |
 | `--no-flow` | `XT_NO_FLOW` | | 关 | 不发 Vision flow 声明，也不做客户端侧 Vision 分帧。**默认不需要**（两端都支持 Vision） |
 | `--client-ver` | `XT_CLIENT_VER` | | `26.3.27` | REALITY 上报的 ClientVer，须落在服务端 `min/maxClientVer` 区间内 |
+| `--fingerprint` | `XT_FINGERPRINT` | | `chrome` | ClientHello 指纹 profile 名（可选值见 `--help`）。**未知名字启动即失败**（不静默回退）。只改 TLS 外观，**不改 REALITY 认证**；能力边界见 [`docs/fingerprint-plan.md`](docs/fingerprint-plan.md) |
+| `--check` | `XT_CHECK` | | 关 | 客户端配置自检：打印生效的 fingerprint / no-flow / client-ver / server / listen（UUID 脱敏）后退出，不监听端口。⚠️ wasmtime 下退出码只可观察 **0 / 非 0**，脚本别断言 `== 2` |
 | `--self-test` | `XT_SELF_TEST` | | | 只做 REALITY 握手并报告耗时，不起 SOCKS5 |
 | （无参数） | `XT_MODE=server` | | | 等价于子命令 `server`，供不方便写 args 的部署使用 |
 
@@ -402,6 +419,8 @@ xray-wasm/
   docs/
     verification-log.md  每条结论的可复现实验与原始输出（V1–V20）
     port-map.md          移植依赖图（meow-rs 的精确依赖面与陷阱）
+    fingerprint-plan.md  浏览器指纹伪装：配置面、能力边界与 Chrome 改版维护手册
+    fingerprint-security.md  指纹伪装的威胁模型与残余风险（T4）
   scripts/
     check.sh             本地 = CI 的全部检查（唯一事实来源）
     env.sh               构建/运行环境
@@ -437,7 +456,7 @@ curl --proxy socks5h://…
 | **wasmtime 的四个 flag** | `-S tcp=y -S inherit-network=y -S allow-ip-name-lookup=y -S inherit-env=y` **缺一不可**。缺 `inherit-network` 报 `PermissionDenied`（像被墙）；缺 `inherit-env` 则认证配置静默失效 |
 | **纯 Rust 手写 TLS** | REALITY 的认证藏在 ClientHello 的 `session_id` 里，需要字节级控制；`rustls` 不暴露该控制点。而 `boring`(BoringSSL) 是 C++，编译到 wasm 代价极高 |
 | **非阻塞 socket + 自研事件循环** | wasip2 没有 tokio reactor，也没有线程。socket 用 `wasi:sockets` 直连（非阻塞、pollable 就绪通知），事件循环用 Bytecode Alliance 的 `wstd` |
-| **不使用 ML-KEM** | 现代 Chrome 指纹走 X25519MLKEM768 混合交换，但已实测服务端**同样接受纯 X25519**（见 V7），省掉一整个依赖。官方客户端的 ClientHello 里**同时**带纯 X25519 key_share，所以服务端侧也不必实现 ML-KEM |
+| **不使用 ML-KEM** | 现代 Chrome 指纹走 X25519MLKEM768 混合交换，但已实测服务端**同样接受纯 X25519**（见 V7），省掉一整个依赖。官方客户端的 ClientHello 里**同时**带纯 X25519 key_share，所以服务端侧也不必实现 ML-KEM。⚠️ 客户端 profile **既不声明也不发送 11ec**（`supported_groups` / `key_share` 里都没有）：声明而不给 key_share 会触发 HelloRetryRequest（T4 实测 5/5）⇒ 握手失败，见 [`docs/fingerprint-plan.md`](docs/fingerprint-plan.md) §3.2 |
 
 ---
 
@@ -537,7 +556,8 @@ curl -sS 'https://crates.io/api/v1/crates?q=reality'   # 无第二个服务端
 | 限制 | 影响 | 说明 |
 |---|---|---|
 | **`e2e-test.sh`（wasm 客户端 → 官方 Xray 服务端）红** | 与本工程的 Vision 无关 | 冷启动的 官方 Xray 服务端上，本工程 wasm 客户端首次 REALITY 握手会卡住；HEAD 上逐字复现，见 `docs/verification-log.md` V27 |
-| **TLS 指纹非浏览器形状** | 功能可用，但抗 JA3/JA4 与主动探测弱于官方客户端 | 手写 ClientHello 未实现 uTLS 的 Chrome 伪装 |
+| **指纹伪装只做到「可观测字段一致」** | JA4 与真 Chrome 全等（已实测）；但**不是**实现了 Chrome 指纹 | 客户端**默认**发一个「PQ 尚未默认开启时期」的 Chrome 形状（约 Chrome 114：无 11ec），而非当前最新 Chrome。当前 Chrome 比我们多声明 X25519MLKEM768(11ec) 并带它的 `key_share`，我们两者都不发（声明而不给 key_share 会触发 HRR，T4 实测 5/5 ⇒ 握手失败）；真实 ECH 也只发 GREASE 占位。已知不一致点与代价见 [`docs/fingerprint-plan.md`](docs/fingerprint-plan.md) |
+| **无后量子密钥交换（真实的密码学降级）** | 今天的流量可被录下、等未来量子计算机成熟后解密 | 我们只做纯 X25519；真 Chrome 用 X25519MLKEM768 混合以抗「先存后解」。这不是外观问题，是**明确的非目标**（引入 PQ 依赖 + 支持 HRR 会与 REALITY 认证语义冲突），详见 [`docs/fingerprint-security.md`](docs/fingerprint-security.md) §3.1 #8 |
 | **无 XTLS-Vision DIRECT splice** | 仅性能差异，不影响连通 | 功能路径完整 |
 | **无 UDP / Mux / 后量子** | QUIC / HTTP3 经此代理不可用 | ML-KEM、ML-DSA-65、`VlessPacketConn` 均未实现 |
 | **无 SOCKS5 UDP ASSOCIATE / BIND** | 仅支持 CONNECT | 对验证协议栈无增量价值 |
@@ -575,7 +595,8 @@ wasip2 没有线程，但支持非阻塞 socket。实现为**单线程协作式�
 ## 测试
 
 ```
-cargo test --workspace        # 100 passed（cli 16 / runtime 8 / tls 37 / vless 39）
+cargo test --workspace        # 191 passed（单测 145：cli 28 / runtime 8 / tls 50 / vless 59；
+                              #  集成 46：指纹差分 20 / 指纹安全 26）
 ./scripts/check.sh            # 上面 + fmt + clippy -D warnings + wasm 构建 + 依赖树约束
 ```
 

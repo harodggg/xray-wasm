@@ -9,7 +9,9 @@
 //! TLS / REALITY configuration types.
 //!
 //! These are the upstream `meow-transport` config structs, unchanged apart from
-//! the deletion of the unused ML-KEM toggle. They carry no runtime dependency.
+//! the deletion of the unused ML-KEM toggle and the documented contract of
+//! [`TlsConfig::fingerprint`] (which upstream left unimplemented). They carry no
+//! runtime dependency.
 
 /// Source of the ECH config list.
 ///
@@ -97,11 +99,27 @@ pub struct TlsConfig {
     /// Optional mutual-TLS client certificate (PEM-encoded).
     pub client_cert: Option<ClientCert>,
 
-    /// `client-fingerprint` YAML value.
+    /// `client-fingerprint` YAML value：用哪个 ClientHello profile。
     ///
-    /// uTLS fingerprint profile applied to the ClientHello. Retained for
-    /// interface compatibility; the hand-rolled REALITY ClientHello builder
-    /// does not implement fingerprint spoofing.
+    /// **语义定稿**（profile 表见 `crate::fingerprint`，接线见 `crate::reality`）：
+    ///
+    /// * `None` 或 `Some("")`（k8s 里没填的字段常是空串）→ 默认 profile
+    ///   [`crate::fingerprint::DEFAULT_PROFILE_NAME`]（`chrome`）；
+    /// * 未知名字 → **配置错误**（`TransportError::Config`），启动即失败；
+    ///   **绝不静默回退**到 `plain` —— 静默降级会让用户以为在伪装、其实没有。
+    ///   错误文本里会列出可用名字（来自 `fingerprint::profile_names()`）；
+    /// * 名字**大小写敏感**，不做别名猜测。
+    ///
+    /// 能力边界（**不要读成「实现了 Chrome 指纹」**）：profile 只对齐真 Chrome 的
+    /// **可观测字段**（legacy_version / cipher 列表 / 扩展集合与顺序 /
+    /// `ec_point_formats` / ALPN / `sigalgs` / GREASE 模式 / compression），而且对齐的是
+    /// 一个**有版本年代的**形状（约 Chrome 114）。`supported_groups` 里**不声明**
+    /// X25519MLKEM768(11ec)：声明却不给它的 key_share 会触发 HelloRetryRequest，
+    /// 而本工程不支持 HRR ⇒ 握手直接失败（T4 实测 5/5）。真实 ECH 也只发 GREASE 占位。
+    /// 已知不一致点与代价见 `docs/fingerprint-plan.md`。
+    ///
+    /// 指纹只改外观，**不改 REALITY 认证**：HKDF 的输入仍是 ClientHello 的
+    /// `random`（握手消息偏移 6..26），认证密文仍占 `session_id[0..16]`。
     pub fingerprint: Option<String>,
 
     /// Extra CA certificates (DER-encoded) added to the root store in
@@ -114,8 +132,11 @@ pub struct TlsConfig {
     /// `Some(EchOpts::Config(bytes))` → inline ECH config list.
     /// DNS-sourced ECH is deferred; see [`EchOpts`].
     ///
-    /// The REALITY path rejects ECH outright: the ClientHello layout is
-    /// hand-rolled and cannot carry `encrypted_client_hello`.
+    /// **真实 ECH 不做**：REALITY 路径直接拒绝 `Some(_)`（配置错误
+    /// `reality-opts cannot be combined with ech-opts`，见 `reality.rs`）。
+    /// 指纹 profile 在 ClientHello 里为「形状」发出的 ECH 相关内容是
+    /// **GREASE 占位**，不是真 ECH，也不读取这里的配置 ——
+    /// 能力边界与代价见 `docs/fingerprint-plan.md` §3.2。
     pub ech: Option<EchOpts>,
 
     /// REALITY authentication options. When present, TLS uses the dedicated

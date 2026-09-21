@@ -2408,3 +2408,59 @@ T3/T4 的执行者（testing / security）在收尾前**中途失败**，落盘�
 安全测试、抓包脚本、两份 docs）完整且全绿；缺口部分（接线后的真机探针复核、
 真机矩阵、层构造期拒绝未知名）由 lead 补跑并复核，任务的写入范围与结论归因
 已在 `docs/fingerprint-*.md` 与本节中标注。
+
+## V29 · V24 终态：根因已定位并修复，随 v0.7.1 发布
+
+V24 此前在本文档里标的是「**根因未定位**」。2026-09-21 定位、修复并发布。
+
+### 根因
+
+`NetStream` 的**读就绪等待**（`Ready{tag:"read"}`）出现「宿主 `wasi:io/poll::poll()` 报该 pollable
+**就绪**、而 `pollable.ready()` 报**不就绪**」：任务每轮被唤醒都返回 `Pending` 并重新注册 waker
+⇒ `wstd::runtime::block_on` 永不阻塞，以 **~2.1–3.5 万次/秒**空转；同进程其它任务（含连接服务
+与诊断心跳）全部被饿死。触发点是**一批连接同时关闭**（300 条悬停连接在 t=8s 被关掉，诊断心跳
+恰好停在 t+8.5s），与 256 那个「显现闸门」无因果关系。
+
+判据（都可复现）：
+
+* `sample <wasmtime pid>`：3171 个样本中 2887 个（**91%**）落在宿主 `wasi:io/poll` 实现内
+  （`Host::poll → PollList::poll → TcpSocket::ready → poll_finish_connect → tokio Registration::poll_ready`）；
+* 反应器循环内部心跳（`WSTD_DIAG=1`）：`iters≈17,485/0.5s`、`poll_calls≈17,350/0.5s`、
+  每次 `poll()` 恰好返回 **1** 个就绪索引、`ready_list=1`；健康窗口只有 `iters≈152/0.5s`；
+* 路径自打印计数：只有 `tag=read` 在涨（`poll=200k/400k/…/800k`），`timeout()`、accept/connect
+  裸 `WaitFor` 一次都没打 ⇒ 排除其它等待路径。
+
+### 修复（两处，缺一不可）
+
+1. `crates/xt-wasm-runtime/src/wasi.rs`：`Ready::poll` 兜底 —— 连续 `READY_FUTILE_LIMIT=8` 次
+   「被唤醒但 `ready()` 说不就绪」就**放行**，由 `read()/write()` 的返回值（数据/EOF/错误）裁定；
+2. `vendor/wstd`（0.6.8 + `[patch.crates-io]`）：反应器 `check_pollables` 改为**唤醒即摘除**。
+
+单独任一处都不够：仅 wstd 补丁 → hover300 marginal 0.3858（仍不过）；仅兜底 → 回落 marginal 1.8458。
+
+### 验证（`scripts/v24-field-test.sh`，判据 <0.15 / =200 / <0.15）
+
+| 配置/场景 | hover300 marginal | 悬停 curl | 回落 marginal | 裁定 |
+|---|---|---|---|---|
+| before（原始） | 0.7045 ✗ | 000 ✗ | 0.9820 ✗ | 复现 |
+| 修复 · 黑洞（原始场景，两轮） | **0.0179 / −0.0036** ✓ | **200** ✓ | **0.0054 / −0.0018** ✓ | 不复现 |
+| 修复 · 静默监听器（可达，一轮） | **0.0366** ✓ | 000（256 上限排队，服务端 `Forwarded=0`） | **0.0684** ✓ | 不复现 |
+
+回归：`e2e-wasm-to-wasm` 5/5、`e2e-vision` 4/4、`./scripts/check.sh` 9/9。
+心跳行数是卡死的直接读数：修复前 1–2 行，修复后 idle 15 / hover 35 / 回落 59（打满窗口）。
+
+### 发布
+
+tag **v0.7.1**（提交 `470283b` fix + `dd2452d` + `c0a5fe1` release-prep），Release 四个 job 全绿：
+发布前验证 / 构建 wasm 包 / 构建并推送容器镜像 / 创建 GitHub Release。
+Release 资产 `xt-wasm-cli.wasm`（约 478KB）+ `.sha256`，wasm 模块 SHA-256
+`bdbc6d753c7d8233702781a035b75501077fb9e125b099c9d1f860f298ff0ebb`。
+
+### 仍然诚实的边界
+
+* 这是**打断机制**的修法，不是 wasmtime 的根因修复：`poll()` 与 `ready()` 为何分歧尚未证明
+  （上游语义 vs 我方缓存 pollable），真 wasm 最小探针仍是判别手段（未做）；
+* 兜底阈值 8 次是启发式：它只在「宿主说就绪、ready 说不就绪」时累计，实测触发很局部
+  （仅批量关闭窗口 65/110/254 次，idle/hover/60 条窗口 0 次），但误触发面未做穷举；
+* `vendor/` + `[patch.crates-io]` 是供应链改动，且是修复的一半，移除需谨慎；
+* V27（官方 Xray 服务端首连 TTFB ≈5.25s）仍未修，属上游行为。

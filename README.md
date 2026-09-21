@@ -16,14 +16,14 @@ docker run --rm -p 127.0.0.1:1080:1080 \
   -e XT_LISTEN=0.0.0.0:1080 \
   -e XT_SERVER=<服务端 ip:port> -e XT_PBK=<公钥> -e XT_SID=<shortId> \
   -e XT_SNI=<伪装域名> -e XT_UUID=<uuid> \
-  ghcr.io/harodggg/xray-wasm:v0.7.0
+  ghcr.io/harodggg/xray-wasm:v0.7.1
 
 # 服务端：REALITY 入站 → 目标站（k3s 用这个）
 docker run --rm -p 8443:8443 \
   -e XT_PRIVATE_KEY=<私钥> -e XT_SHORT_IDS=<shortId> \
   -e XT_SERVER_NAMES=<伪装域名> -e XT_DEST=<同一个域名的 host:port> \
   -e XT_USERS=<uuid> \
-  ghcr.io/harodggg/xray-wasm:v0.7.0 server
+  ghcr.io/harodggg/xray-wasm:v0.7.1 server
 ```
 
 > 验证过程与原始输出见 [`docs/verification-log.md`](docs/verification-log.md)。
@@ -121,7 +121,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 | 方式 | 位置 |
 |---|---|
 | wasm 模块 | [Releases](https://github.com/harodggg/xray-wasm/releases) 里的 `xt-wasm-cli.wasm`（附 `SHA256SUMS`） |
-| 容器镜像 | `ghcr.io/harodggg/xray-wasm:v0.7.0`（amd64 / arm64，匿名可拉） |
+| 容器镜像 | `ghcr.io/harodggg/xray-wasm:v0.7.1`（amd64 / arm64，匿名可拉） |
 | 自行构建 | 见下方「从源码构建」 |
 
 k8s 部署清单与安全须知：[`deploy/k8s/`](deploy/k8s/README.md)。

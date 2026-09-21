@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use xt_wasm_runtime::{
     block_on, relay_bidirectional, sleep, spawn_task, timeout, NetStream, Stream,
 };
-use xt_wasm_tls::{RealityConfig, RealityTlsLayer, TlsConfig, Transport};
+use xt_wasm_tls::{RealityConfig, RealityTlsLayer, TlsConfig, Transport, TransportError};
 use xt_wasm_vless::{Cmd, VisionConn, VlessAddr, VlessConn};
 
 /// XTLS-Vision 的流控名。服务端 `settings.clients[].flow` 必须与此一致。
@@ -568,6 +568,39 @@ impl Shared {
     }
 }
 
+/// REALITY 握手的**尝试次数**（1 次正常 + 至多 1 次重试）。
+///
+/// 只救一种失败：**握手超时**。依据是 `docs/findings/v27-wake.md` 的实测 ——
+/// 机器出口/dest 的瞬态停顿会让某一条连接的首个飞行包晚于握手死线，而**紧接着
+/// 的新连接 0.211s 就回包**。所以重试一次就能把「用户第一个请求直接失败」
+/// 变成「多等约一个死线后成功」。
+///
+/// 为什么不多试几次、也不做退避：重试救不了「服务端真的在慢」，只会让并发槽位
+/// （上限 [`MAX_CONCURRENT_CONNS`]）被占得更久。代价见
+/// `docs/findings/v27-retry.md`：失败路径墙钟 ~10s → ~20s，且线上每次失败会多
+/// 发一条短连接的 ClientHello。
+const REALITY_HANDSHAKE_ATTEMPTS: usize = 2;
+
+/// 「这次握手失败该算超时吗」的墙钟下限。
+///
+/// `xt-wasm-tls` 目前把超时写成 `TransportError::Tls(String)`，**没有独立的
+/// timeout variant**，而它的握手死线是 10s。这里刻意**不解析错误文案**
+/// （文案一改，重试就会静默失效），改用两个独立信号共同判定：
+///
+/// 1. 错误类别是 `TransportError::Tls` —— 排除配置错误、IO 错误；
+/// 2. 这次尝试**确实耗满了死线**（≥ 9s，留 1s 给定时器到点与错误冒泡的抖动）。
+///
+/// 协议/认证/解析类错误全部在**亚秒级**返回，第 2 条永远不成立 ⇒
+/// 「认证失败 / 配置错误 / TLS 版本不匹配 / 解析错误」**不会被重试**。
+///
+/// 已知边界（有意如此）：≥ 9s 但**不是** `Tls` 类别的失败（例如长时间停顿后
+/// 收到 RST）不重试 —— 严格按任务边界「只重试超时」。
+const HANDSHAKE_TIMEOUT_FLOOR: Duration = Duration::from_secs(9);
+
+fn is_handshake_timeout(err: &TransportError, elapsed: Duration) -> bool {
+    matches!(err, TransportError::Tls(_)) && elapsed >= HANDSHAKE_TIMEOUT_FLOOR
+}
+
 /// 建立一条到目标地址的隧道（REALITY → VLESS → Vision）。
 ///
 /// 建连是**真异步**的：`connect` 内部走 `start_connect` + pollable，不会阻塞其它连接。
@@ -583,21 +616,76 @@ async fn open_tunnel(shared: &Shared, host: &str, port: u16) -> Result<Box<dyn S
         VlessAddr::domain(host).map_err(|e| format!("目标地址非法：{e}"))?
     };
 
-    let sock = xt_wasm_runtime::connect(&shared.server)
-        .await
-        .map_err(|e| {
-            format!(
-                "连接服务端 {} 失败：{e}（wasmtime 需要 -S tcp=y 和 -S inherit-network=y）",
-                shared.server
-            )
-        })?;
-
+    // REALITY 层只构造一次：构造失败是**配置错误**（未知指纹、reality/ech 冲突…），
+    // 重试没有意义，当场失败。
     let layer =
         RealityTlsLayer::new(&shared.tls).map_err(|e| format!("构造 REALITY 层失败：{e}"))?;
-    let tls_stream = layer
-        .connect(Box::new(sock) as Box<dyn Stream>)
-        .await
-        .map_err(|e| format!("REALITY 握手失败：{e}"))?;
+
+    let mut tls_stream: Option<Box<dyn Stream>> = None;
+    let mut first_timeout: Option<Duration> = None;
+
+    for attempt in 1..=REALITY_HANDSHAKE_ATTEMPTS {
+        let started = Instant::now();
+
+        let sock = xt_wasm_runtime::connect(&shared.server)
+            .await
+            .map_err(|e| {
+                format!(
+                    "连接服务端 {} 失败：{e}（wasmtime 需要 -S tcp=y 和 -S inherit-network=y）",
+                    shared.server
+                )
+            })?;
+
+        match layer.connect(Box::new(sock) as Box<dyn Stream>).await {
+            Ok(stream) => {
+                if let Some(first) = first_timeout {
+                    // 重试成功时必须看得出来：这是第几次、这次多快、上次等了多久。
+                    eprintln!(
+                        "[socks5] REALITY 握手第 {attempt}/{REALITY_HANDSHAKE_ATTEMPTS} 次尝试\
+                         成功（本次 {:.2}s；第 1 次超时等了 {:.1}s）",
+                        started.elapsed().as_secs_f32(),
+                        first.as_secs_f32(),
+                    );
+                }
+                tls_stream = Some(stream);
+                break;
+            }
+            Err(e) => {
+                let elapsed = started.elapsed();
+                if first_timeout.is_none() && is_handshake_timeout(&e, elapsed) {
+                    eprintln!(
+                        "[socks5] REALITY 握手超时（{:.1}s）→ 新开一条连接重试一次\
+                         （瞬态停顿；实测后续连接 0.2–0.7s 就能回包）",
+                        elapsed.as_secs_f32(),
+                    );
+                    first_timeout = Some(elapsed);
+                    continue;
+                }
+                return Err(match first_timeout {
+                    // 超时且已用完重试次数：把两次尝试都写进错误里，便于对账。
+                    Some(first) => format!(
+                        "REALITY 握手失败：{e}（共 {REALITY_HANDSHAKE_ATTEMPTS} 次尝试；\
+                         第 1 次超时 {:.1}s，第 {attempt} 次 {:.1}s）",
+                        first.as_secs_f32(),
+                        elapsed.as_secs_f32(),
+                    ),
+                    // 非超时：**不重试**，并把这个决定写出来，免得被读成「重试没生效」。
+                    None => format!("REALITY 握手失败：{e}（非超时，不重试）"),
+                });
+            }
+        }
+    }
+
+    let tls_stream = match tls_stream {
+        Some(s) => s,
+        // 循环里每条分支要么 break、要么 return，这里不可达；写成可控错误而不是
+        // `unwrap()`，避免在代理路径上留一个 panic 点。
+        None => {
+            return Err(format!(
+                "REALITY 握手失败：{REALITY_HANDSHAKE_ATTEMPTS} 次尝试都没有返回结果（内部错误）"
+            ))
+        }
+    };
 
     // flow 声明与 VisionConn 必须**同进同退**：只关掉声明却仍然做 Vision 分帧，
     // 会把填充帧当成普通数据发给一个不做拆帧的服务端 —— 「连上了但数据是坏的」，
@@ -914,6 +1002,34 @@ mod tests {
         std::env::set_var("XT_TEST_EMPTY_VAR", "");
         assert!(env_opt("XT_TEST_EMPTY_VAR").is_none());
         std::env::remove_var("XT_TEST_EMPTY_VAR");
+    }
+
+    /// 重试判据是**两个信号**的合取，两个方向都要钉住：
+    /// 少一个条件就会把「协议/认证错误」也拿去重试（掩盖真问题、白等一个往返）。
+    ///
+    /// 这三条与验收正/负样本互补：样本验行为，这里验边界（跑得快、确定性好）。
+    #[test]
+    fn only_handshake_timeouts_are_retried() {
+        // ① 超时：`Tls` 类错误 + 确实耗满了死线（xt-wasm-tls 的死线是 10s）
+        assert!(is_handshake_timeout(
+            &TransportError::Tls("did not complete".into()),
+            Duration::from_secs(10)
+        ));
+        // ② 同样是 `Tls`，但亚秒级返回 ⇒ 协议/认证/解析类错误 ⇒ **不重试**
+        assert!(!is_handshake_timeout(
+            &TransportError::Tls("unexpected plaintext handshake".into()),
+            Duration::from_millis(300)
+        ));
+        // ③ 耗满了死线但不是 `Tls`（例如连接层的 IO 错误）⇒ **不重试**
+        assert!(!is_handshake_timeout(
+            &TransportError::Io(std::io::Error::other("boom")),
+            Duration::from_secs(10)
+        ));
+        // ④ 下限是「≥ 9s」：8.9s 不算耗满死线（10s 死线到不了 9s 之前）
+        assert!(!is_handshake_timeout(
+            &TransportError::Tls("x".into()),
+            Duration::from_millis(8_900)
+        ));
     }
 
     /// **`--no-flow` 必须在线上真的生效**，而且两件事要一起生效：

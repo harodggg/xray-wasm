@@ -35,6 +35,11 @@ PBK="${XT_TEST_PBK:-HgNph_44uv7AO4OZFb4vROlrokgklJ98HiqldBWroFg}"
 SID="${XT_TEST_SID:-64f6ffd42769a12c}"
 SNI="${XT_TEST_SNI:-www.cloudflare.com}"
 SERVER="${XT_TEST_SERVER:-127.0.0.1:8443}"
+# 就绪检查必须用**同一个**地址，不能硬编码 8443：本仓库原先这里写死 8443，
+# 于是 `XT_TEST_SERVER=127.0.0.1:8643` 这种覆盖只在第 2 步生效，第 1 步仍去
+# 探 8443 —— 表现为「服务端启动失败」或静默连到别的进程上（误导性很强）。
+SRV_HOST="${SERVER%%:*}"
+SRV_PORT="${SERVER##*:}"
 SOCKS="${XT_TEST_SOCKS:-127.0.0.1:1080}"
 SOCKS_USER="${XT_TEST_SOCKS_USER:-testuser}"
 SOCKS_PASS="${XT_TEST_SOCKS_PASS:-testpass}"
@@ -58,13 +63,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> 1/8 确保 官方 Xray REALITY 服务端在跑"
-if nc -z 127.0.0.1 8443 2>/dev/null; then
-    pass "服务端已在 127.0.0.1:8443"
+if nc -z "$SRV_HOST" "$SRV_PORT" 2>/dev/null; then
+    pass "服务端已在 ${SERVER}"
 else
     "$XRAY" run -c "$SERVER_CFG" >"$XW_DIR/.e2e-server.log" 2>&1 &
     SERVER_PID=$!
     sleep 1.5
-    nc -z 127.0.0.1 8443 2>/dev/null || {
+    nc -z "$SRV_HOST" "$SRV_PORT" 2>/dev/null || {
         cat "$XW_DIR/.e2e-server.log" >&2
         fail "服务端启动失败"
     }
@@ -81,7 +86,7 @@ XT_HANDSHAKE_TIMEOUT="$HANDSHAKE_TIMEOUT" \
     --uuid "$UUID" --listen "$SOCKS" >"$XW_DIR/.e2e-client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 2
-if ! nc -z 127.0.0.1 1080 2>/dev/null; then
+if ! nc -z "${SOCKS%%:*}" "${SOCKS##*:}" 2>/dev/null; then
     echo "--- 客户端日志 ---" >&2
     cat "$XW_DIR/.e2e-client.log" >&2
     fail "wasm 客户端没有监听 $SOCKS"
@@ -120,7 +125,7 @@ pass "https://example.com -> $CODE"
 
 echo "==> 6/8 半开连接不得永久卡死代理（k8s 探针 / 端口扫描器会这样）"
 # 连上但不发任何数据，保持 6 秒；协商超时是 ${HANDSHAKE_TIMEOUT}s
-( sleep 6 | nc 127.0.0.1 1080 >/dev/null 2>&1 ) &
+( sleep 6 | nc "${SOCKS%%:*}" "${SOCKS##*:}" >/dev/null 2>&1 ) &
 STALL_PID=$!
 sleep 4   # 超过协商超时，代理应已丢弃这条半开连接
 CODE=$(proxy_curl -o /dev/null -w '%{http_code}' https://example.com 2>&1) || CODE='000'
@@ -132,7 +137,7 @@ echo "==> 7/8 并发：一条长连接不得独占代理（多路复用是否真
 # 起一条「已建立隧道但一直不发数据」的长连接。顺序 accept 的实现会被它独占到结束，
 # 多路复用的实现则不受影响 —— 这条用例就是用来区分这两种实现的。
 python3 "$XW_DIR/scripts/hold-tunnel.py" \
-    127.0.0.1 1080 "$SOCKS_USER" "$SOCKS_PASS" example.com 443 8 \
+    "${SOCKS%%:*}" "${SOCKS##*:}" "$SOCKS_USER" "$SOCKS_PASS" example.com 443 8 \
     >"$XW_DIR/.e2e-hold.log" 2>&1 &
 HOLD_PID=$!
 

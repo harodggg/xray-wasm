@@ -169,32 +169,31 @@ impl RealityTlsLayer {
     }
 }
 
-/// Runtime-free replacement for the upstream handshake timeout at
-/// `reality_tls.rs:130`.
+/// 给整个握手套一个**定时器驱动**的死线。
 ///
-/// Upstream wrapped the whole handshake in a tokio timeout, which needs a tokio
-/// time driver; wasip2 has none. [`xt_wasm_runtime::block_on`] re-polls a
-/// `Pending` future unconditionally (its `Pending` is not waker-driven), so
-/// checking the wall clock on every poll enforces the same bound without a
-/// timer, a tokio time feature, or a spawned task.
+/// # 为什么不能靠「每次 poll 检查墙钟」
 ///
-/// The handshake is strictly sequential request/response, so there is no
-/// progress that can be starved by this check.
+/// 这里原先用 `poll_fn` 在每次被 poll 时比较墙钟。问题是握手的读等待是
+/// **纯 waker 驱动**的：对端不回包时没有任何事件唤醒这个 future，于是那个
+/// 「10 秒死线」形同虚设 —— 实测一次卡住的握手到 **18.0s** 才打印
+/// `did not complete within 10s`（证据见 `docs/findings/v27-wake.md`）。
+///
+/// 现在改用 [`xt_wasm_runtime::timeout`]：wasip2 下它基于 `wstd` 的定时器
+/// pollable（SOCKS 协商超时早就在用同一套），到点会**主动唤醒**，所以死线
+/// 必达。host 上走的是同一个 API 的宿主实现。
+///
+/// 注意：这只让**超时按时生效**（报错准时、调用方不再被拖住），
+/// 不解决握手失败本身 —— 那属于链路瞬态，见公告板 §2。
 async fn handshake_with_deadline<F>(handshake: F) -> Result<RealityTlsStream>
 where
     F: std::future::Future<Output = Result<RealityTlsStream>>,
 {
-    let deadline = SystemTime::now() + REALITY_HANDSHAKE_TIMEOUT;
-    let mut handshake = Box::pin(handshake);
-    std::future::poll_fn(move |cx| {
-        if SystemTime::now() >= deadline {
-            return Poll::Ready(Err(TransportError::Tls(format!(
-                "Reality TLS: handshake did not complete within {REALITY_HANDSHAKE_TIMEOUT:?}"
-            ))));
-        }
-        handshake.as_mut().poll(cx)
-    })
-    .await
+    match xt_wasm_runtime::timeout(REALITY_HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(TransportError::Tls(format!(
+            "Reality TLS: handshake did not complete within {REALITY_HANDSHAKE_TIMEOUT:?}"
+        ))),
+    }
 }
 
 #[async_trait::async_trait]

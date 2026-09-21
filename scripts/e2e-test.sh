@@ -85,13 +85,25 @@ XT_HANDSHAKE_TIMEOUT="$HANDSHAKE_TIMEOUT" \
     --server "$SERVER" --pbk "$PBK" --sid "$SID" --sni "$SNI" \
     --uuid "$UUID" --listen "$SOCKS" >"$XW_DIR/.e2e-client.log" 2>&1 &
 CLIENT_PID=$!
-sleep 2
-if ! nc -z "${SOCKS%%:*}" "${SOCKS##*:}" 2>/dev/null; then
+# 等客户端监听：**必须是轮询**，不能用固定 sleep。开了 V27 就绪门
+# （XT_WARMUP_GATE=1）时，客户端会先预热再 bind，官方服务端下要 ~5s 才监听。
+CLIENT_WAIT="${XT_TEST_CLIENT_WAIT_SECS:-20}"
+LISTENED=0
+i=0
+while [ "$i" -lt "$CLIENT_WAIT" ]; do
+    if nc -z "${SOCKS%%:*}" "${SOCKS##*:}" 2>/dev/null; then
+        LISTENED=1
+        break
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+if [ "$LISTENED" != "1" ]; then
     echo "--- 客户端日志 ---" >&2
     cat "$XW_DIR/.e2e-client.log" >&2
-    fail "wasm 客户端没有监听 $SOCKS"
+    fail "wasm 客户端没有在 ${CLIENT_WAIT}s 内监听 $SOCKS"
 fi
-pass "客户端已监听 $SOCKS"
+pass "客户端已监听 ${SOCKS}（等待 ${i}s）"
 
 # 认证是否真的生效，先看启动日志里怎么写的 —— 环境变量没传进 guest 时
 # 这里会显示「认证：无」，是最常见的静默失效。

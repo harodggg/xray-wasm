@@ -16,14 +16,14 @@ docker run --rm -p 127.0.0.1:1080:1080 \
   -e XT_LISTEN=0.0.0.0:1080 \
   -e XT_SERVER=<服务端 ip:port> -e XT_PBK=<公钥> -e XT_SID=<shortId> \
   -e XT_SNI=<伪装域名> -e XT_UUID=<uuid> \
-  ghcr.io/harodggg/xray-wasm:v0.7.1
+  ghcr.io/harodggg/xray-wasm:v0.7.2
 
 # 服务端：REALITY 入站 → 目标站（k3s 用这个）
 docker run --rm -p 8443:8443 \
   -e XT_PRIVATE_KEY=<私钥> -e XT_SHORT_IDS=<shortId> \
   -e XT_SERVER_NAMES=<伪装域名> -e XT_DEST=<同一个域名的 host:port> \
   -e XT_USERS=<uuid> \
-  ghcr.io/harodggg/xray-wasm:v0.7.1 server
+  ghcr.io/harodggg/xray-wasm:v0.7.2 server
 ```
 
 > 验证过程与原始输出见 [`docs/verification-log.md`](docs/verification-log.md)。
@@ -121,7 +121,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' --proxy socks5h://127.0.0.1:1080 https
 | 方式 | 位置 |
 |---|---|
 | wasm 模块 | [Releases](https://github.com/harodggg/xray-wasm/releases) 里的 `xt-wasm-cli.wasm`（附 `SHA256SUMS`） |
-| 容器镜像 | `ghcr.io/harodggg/xray-wasm:v0.7.1`（amd64 / arm64，匿名可拉） |
+| 容器镜像 | `ghcr.io/harodggg/xray-wasm:v0.7.2`（amd64 / arm64，匿名可拉） |
 | 自行构建 | 见下方「从源码构建」 |
 
 k8s 部署清单与安全须知：[`deploy/k8s/`](deploy/k8s/README.md)。
@@ -186,6 +186,7 @@ xt-wasm-cli --server <ip:port> --pbk <...> --sid <...> --sni <...> --uuid <uuid>
 | `--socks-pass` | `XT_SOCKS_PASS` | | | SOCKS5 密码 |
 | `--handshake-timeout` | `XT_HANDSHAKE_TIMEOUT` | | `15` | 协商阶段读超时（秒） |
 | `--no-flow` | `XT_NO_FLOW` | | 关 | 不发 Vision flow 声明，也不做客户端侧 Vision 分帧。**默认不需要**（两端都支持 Vision） |
+| `--warmup-gate` | `XT_WARMUP_GATE` | | 关 | **V27 就绪门**：先建一条一次性隧道并**等到第一个响应字节**（官方 Xray 服务端首连的一次性初始化实测恒定 +5.00s），**然后才监听**。于是用户第一条请求落在初始化之后（实测 TTFB 5.76→1.0s）。代价：启动多约 5s、期间端口不可连接。详见 [`docs/findings/v27-not-client-fixable.md`](docs/findings/v27-not-client-fixable.md) |
 | `--client-ver` | `XT_CLIENT_VER` | | `26.3.27` | REALITY 上报的 ClientVer，须落在服务端 `min/maxClientVer` 区间内 |
 | `--fingerprint` | `XT_FINGERPRINT` | | `chrome` | ClientHello 指纹 profile 名（可选值见 `--help`）。**未知名字启动即失败**（不静默回退）。只改 TLS 外观，**不改 REALITY 认证**；能力边界见 [`docs/fingerprint-plan.md`](docs/fingerprint-plan.md) |
 | `--check` | `XT_CHECK` | | 关 | 客户端配置自检：打印生效的 fingerprint / no-flow / client-ver / server / listen（UUID 脱敏）后退出，不监听端口。⚠️ wasmtime 下退出码只可观察 **0 / 非 0**，脚本别断言 `== 2` |
@@ -555,7 +556,7 @@ curl -sS 'https://crates.io/api/v1/crates?q=reality'   # 无第二个服务端
 
 | 限制 | 影响 | 说明 |
 |---|---|---|
-| **`e2e-test.sh`（wasm 客户端 → 官方 Xray 服务端）红** | 与本工程的 Vision 无关 | 冷启动的 官方 Xray 服务端上，本工程 wasm 客户端首次 REALITY 握手会卡住；HEAD 上逐字复现，见 `docs/verification-log.md` V27 |
+| **官方 Xray 服务端首连多 ~5s（V27）** | 只影响「进程启动后的第一条隧道连接」 | 服务端自身的一次性初始化（实测：ServerHello 之后**恒定 +5.00s** 才处理首条应用记录，与客户端何时发无关）。客户端消不掉，只能吸收：v0.7.2 起 `--warmup-gate`（`XT_WARMUP_GATE=1`）**预热完成后才监听**，用户首条请求 5.76–6.09s → 0.95–1.14s；已发布的握手超时重试覆盖「首连超时失败」。证据与三轮实验见 [`docs/findings/v27-not-client-fixable.md`](docs/findings/v27-not-client-fixable.md) |
 | **指纹伪装只做到「可观测字段一致」** | JA4 与真 Chrome 全等（已实测）；但**不是**实现了 Chrome 指纹 | 客户端**默认**发一个「PQ 尚未默认开启时期」的 Chrome 形状（约 Chrome 114：无 11ec），而非当前最新 Chrome。当前 Chrome 比我们多声明 X25519MLKEM768(11ec) 并带它的 `key_share`，我们两者都不发（声明而不给 key_share 会触发 HRR，T4 实测 5/5 ⇒ 握手失败）；真实 ECH 也只发 GREASE 占位。已知不一致点与代价见 [`docs/fingerprint-plan.md`](docs/fingerprint-plan.md) |
 | **无后量子密钥交换（真实的密码学降级）** | 今天的流量可被录下、等未来量子计算机成熟后解密 | 我们只做纯 X25519；真 Chrome 用 X25519MLKEM768 混合以抗「先存后解」。这不是外观问题，是**明确的非目标**（引入 PQ 依赖 + 支持 HRR 会与 REALITY 认证语义冲突），详见 [`docs/fingerprint-security.md`](docs/fingerprint-security.md) §3.1 #8 |
 | **无 XTLS-Vision DIRECT splice** | 仅性能差异，不影响连通 | 功能路径完整 |

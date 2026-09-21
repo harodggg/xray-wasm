@@ -45,6 +45,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xt_wasm_runtime::{
     block_on, relay_bidirectional, sleep, spawn_task, timeout, NetStream, Stream,
 };
@@ -94,6 +95,16 @@ struct Args {
     /// 包进填充帧**。所以 `--no-flow` 必须**同时**关掉 flow 声明和
     /// `VisionConn` 包装 —— 只关一半会让服务端把填充字节当成原始数据。
     no_flow: bool,
+    /// V27 就绪门：**预热完成后才监听**。
+    ///
+    /// 官方 Xray 服务端对「进程启动后的第一条隧道连接」会做一次性初始化（实测恒定
+    /// +5.00s，见 `docs/findings/v27-not-client-fixable.md`）；初始化窗口内到达的连接
+    /// 都要等它结束。开着这个开关时，客户端先建一条一次性隧道并**等到第一个响应字节**，
+    /// 然后才 bind —— 于是用户的第一条请求必然落在初始化之后（实测 ~0.2–0.3s）。
+    ///
+    /// 代价：启动多约 5s（仅当对端是官方服务端；对本工程服务端约 +0.3s），
+    /// 期间端口**不可连接**。默认关闭（`--warmup-gate` / `XT_WARMUP_GATE=1` 打开）。
+    warmup_gate: bool,
     self_test: bool,
 }
 
@@ -114,6 +125,10 @@ fn usage() -> ! {
   --socks-user U --socks-pass P
                        启用 SOCKS5 用户名/密码认证。**监听非回环地址时强烈建议启用**，
                        否则就是开放代理。两者必须同时给出。
+  --warmup-gate        先预热一条一次性隧道（等到第一个响应字节）**再监听**。
+                       官方 Xray 服务端首连的一次性初始化（实测恒定 +5.00s）落在预热上，
+                       用户的第一条请求因此变快（~0.3s）。代价：启动多约 5s，
+                       期间端口不可连接。等价环境变量：XT_WARMUP_GATE=1。
   --handshake-timeout S
                        协商阶段读超时秒数（默认 {}）。防止「连上不发数据」的连接
                        长期占住一个并发槽位。
@@ -259,6 +274,7 @@ fn parse_args() -> Args {
     let mut socks_pass = env_opt("XT_SOCKS_PASS");
     let mut handshake_timeout_secs = env_opt("XT_HANDSHAKE_TIMEOUT");
     let mut no_flow = env_flag("XT_NO_FLOW");
+    let mut warmup_gate = env_flag("XT_WARMUP_GATE");
     let mut self_test = env_flag("XT_SELF_TEST");
     let mut check = env_flag("XT_CHECK");
 
@@ -284,6 +300,7 @@ fn parse_args() -> Args {
             "--socks-pass" => socks_pass = Some(need(i)),
             "--handshake-timeout" => handshake_timeout_secs = Some(need(i)),
             "--no-flow" => no_flow = true,
+            "--warmup-gate" => warmup_gate = true,
             "--self-test" => self_test = true,
             "--check" => check = true,
             "-h" | "--help" => usage(),
@@ -351,6 +368,7 @@ fn parse_args() -> Args {
             })
             .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
         no_flow,
+        warmup_gate,
         self_test,
     }
 }
@@ -554,6 +572,8 @@ struct Shared {
     handshake_timeout_secs: u64,
     /// 见 `Args::no_flow`。
     no_flow: bool,
+    /// 见 `Args::warmup_gate`。
+    warmup_gate: bool,
 }
 
 impl Shared {
@@ -708,6 +728,30 @@ async fn open_tunnel(shared: &Shared, host: &str, port: u16) -> Result<Box<dyn S
     }
 }
 
+/// 预热/就绪门用的目标（与 SNI 无关，认证后才用到；给一个常见的 TLS 目标即可）。
+const WARMUP_HOST: &str = "www.cloudflare.com";
+
+/// V27 预热：**真用一次隧道**（握手 → 写请求 → 等第一个响应字节）后丢弃。
+///
+/// 只握手不算数：官方服务端在握手完成后 0.25s 就能让客户端返回，那 5s 卡在它
+/// **处理首条应用记录**上；必须等到第一个响应字节才算把初始化走完。
+async fn warm_up(shared: &Shared) -> Result<(), String> {
+    let mut tunnel = open_tunnel(shared, WARMUP_HOST, 443).await?;
+    tunnel
+        .write_all(b"GET / HTTP/1.0\r\nHost: www.cloudflare.com\r\n\r\n")
+        .await
+        .map_err(|e| format!("写预热请求失败：{e}"))?;
+    let mut first = [0u8; 1];
+    let n = tunnel
+        .read(&mut first)
+        .await
+        .map_err(|e| format!("读预热响应失败：{e}"))?;
+    if n == 0 {
+        return Err("预热读到 EOF（服务端没回数据）".into());
+    }
+    Ok(())
+}
+
 /// 同时处理的连接数上限。
 ///
 /// 有上限是必须的：内存与 fd 都有限，没有背压的话攻击者可以用一堆慢连接拖垮进程。
@@ -732,6 +776,7 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
         socks_pass: args.socks_pass.clone(),
         handshake_timeout_secs: args.handshake_timeout_secs,
         no_flow: args.no_flow,
+        warmup_gate: args.warmup_gate,
     });
 
     // 指向本工程的服务端时必须 --no-flow。这条提示放在启动日志里而不是只写在
@@ -755,22 +800,50 @@ fn run_socks5(args: &Args, tls: &TlsConfig) -> ! {
         eprintln!("      并配合网络策略限制来源。详见 README 的 k8s 一节。");
         eprintln!("──────────────────────────────────────────────────────────────");
     }
-    println!(
-        "[socks5] 监听 {}，隧道目标 {}，认证：{}，并发上限 {}，ClientHello profile：{}",
-        args.listen,
-        args.server,
-        if has_auth { "用户名/密码" } else { "无" },
-        MAX_CONCURRENT_CONNS,
-        args.fingerprint
-    );
-    println!(
-        "[socks5] 用法： curl --proxy socks5h://{} https://example.com",
-        args.listen
-    );
-
+    // ⚠️这两条日志必须在**真的 bind 成功之后**打印：开了就绪门时 bind 发生在预热之后，
+    // 提前打印会让调用方（e2e / 探针）以为端口已就绪而立刻 curl，拿到 connection refused。
     let listen_addr = args.listen.clone();
+    let listen_shown = args.listen.clone();
+    let server_shown = args.server.clone();
+    let fingerprint_shown = args.fingerprint.clone();
     let result = block_on(async move {
+        // ── V27 就绪门（`--warmup-gate` / `XT_WARMUP_GATE=1`）────────────────────
+        //
+        // 官方 Xray 服务端的一次性初始化只发生在它的**第一条**连接上，但**初始化窗口内**
+        // 到达的连接同样要等它结束（实测：异步预热吸收了自己那 5s，用户首条请求仍 5.54s）。
+        // 所以要让用户首条请求快，就只能**等预热完成再监听**。
+        if shared.warmup_gate {
+            // 措辞注意：这里**不能**出现「监听」二字 —— 调用方（e2e / v27 脚本）用
+            // `grep 监听` 判断端口是否就绪，提前出现会让它们立刻去 curl。
+            eprintln!(
+                "[socks5] V27 就绪门：先预热（官方服务端约 5s），完成后再绑定 SOCKS 端口 {listen_shown}…"
+            );
+            let t0 = Instant::now();
+            match warm_up(&shared).await {
+                Ok(()) => eprintln!(
+                    "[socks5] 预热完成：{:.2}s，准备绑定端口",
+                    t0.elapsed().as_secs_f32()
+                ),
+                Err(e) => eprintln!(
+                    "[socks5] 预热失败（{:.2}s，仍继续启动）：{e}",
+                    t0.elapsed().as_secs_f32()
+                ),
+            }
+        }
+
         let listener = xt_wasm_runtime::listen(&listen_addr).await?;
+        println!(
+            "[socks5] 监听 {}，隧道目标 {}，认证：{}，并发上限 {}，ClientHello profile：{}",
+            listen_shown,
+            server_shown,
+            if has_auth { "用户名/密码" } else { "无" },
+            MAX_CONCURRENT_CONNS,
+            fingerprint_shown
+        );
+        println!(
+            "[socks5] 用法： curl --proxy socks5h://{} https://example.com",
+            listen_shown
+        );
         // 在途连接计数：每个 spawn 出来的任务结束时自减。
         let live = Rc::new(Cell::new(0usize));
 
@@ -873,6 +946,7 @@ fn run_check(args: &Args, tls: &TlsConfig) -> ! {
         effective_alpn_note(&args.fingerprint)
     );
     println!("[check] no-flow     = {}", args.no_flow);
+    println!("[check] warmup-gate = {}", args.warmup_gate);
     println!(
         "[check] client-ver  = {}",
         version_string(args.client_version)
@@ -1102,6 +1176,7 @@ mod tests {
                 socks_pass: None,
                 handshake_timeout_secs: 10,
                 no_flow,
+                warmup_gate: false,
             };
 
             // 目标端口 1：一定有东西在监听的可能性极低，服务端会 ConnectFailed。

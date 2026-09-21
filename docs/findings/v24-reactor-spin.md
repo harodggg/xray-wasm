@@ -178,7 +178,38 @@ hoverR : 1.106004(18s) 1.148456(30s)                        ← 回落 marginal 
 （数据/EOF/error）才是权威。这样能立刻打断空转，代价是偶尔一次多余的 syscall。
 
 
-## 9. 修复与验证（2026-09-21）：两处改动**合起来**才成立
+## 11. 最小 wasm 探针裁定：**上游原生语义没有问题**（2026-09-21）
+
+探针：`crates/xt-wasm-runtime/examples/poll_vs_ready.rs`（真 `wasm32-wasip2`，只碰
+`wasi:sockets` + `wasi:io`，不经过本仓库任何封装）。做法：监听 → accept → 等对端关闭 →
+用「读 pollable + 永远就绪的 0ms 定时器」做**非阻塞** `poll()`，同时读同一个 pollable 的 `ready()`。
+
+```
+# 对端 FIN 正常关闭
+[probe] iter=0..7  poll()就绪列表=[0] 或 [0,1] ⇒ poll认为socket就绪=true ; ready()=true
+[probe] input.read(64) => Err(StreamError::Closed)          ← 真 EOF
+
+# 对端 RST 强制关闭（SO_LINGER 0）
+[probe] iter=0..7  poll()就绪列表=[0] 或 [0,1] ⇒ poll认为socket就绪=true ; ready()=true
+[probe] input.read(64) => Err(StreamError::LastOperationFailed(Error { handle: Resource { handle: 11 } }))
+```
+
+**结论**：
+
+1. **`poll()` 与 `ready()` 在两种关闭方式下都一致**（都报就绪），`read()` 的返回值才是权威
+   （`Closed` = 真 EOF；RST 后是错误）⇒ **不是 wasmtime / WASI 绑定的语义分歧**。
+2. 因此 V24 那个「被唤醒但 `ready()` 说不就绪」的状态，只能来自 **wstd 反应器的唤醒簿记**
+   （上游 `check_pollables` 唤醒时不做注销，wakers 表里会留下**过期 waker**）或我们 `Ready`
+   的 pollable 缓存 / `WaitFor` 复用。这也正是修复里两个改动分别对应的位置。
+3. 探针同时给出了**兜底修法成立的理由**：宿主说就绪时去读，`read()` 会立刻给出
+   `Closed`/错误，不会真的写坏数据 —— 放行是安全的方向。
+
+> 诚实边界：本探针只覆盖「单连接、FIN/RST」两种形状，**没有**复现 300 连接 + 批量关闭的
+> wstd 反应器状态；「过期 waker 具体怎么让某个任务被反复唤醒」仍是**机制推定**，未做
+> 逐 waker 的取证（需要改 wasmtime 或把 wstd 反应器的 wakers 表 dump 出来）。
+
+## 9b. 修复与验证（2026-09-21）：两处改动**合起来**才成立
+
 
 兜底实现（`crates/xt-wasm-runtime/src/wasi.rs`）：`Ready::poll` 在 `Pending` 分支累计
 「被唤醒但 `ready()` 说不就绪」的次数，连续 `READY_FUTILE_LIMIT = 8` 次就**放行**

@@ -915,8 +915,6 @@ dependencies = [
 [[package]]
 name = "wstd"
 version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29b52936db10a79bb724dadd1c2c3aac958e8229dcb1f1c7f2b7044ca9fc6a3a"
 dependencies = [
  "anyhow",
  "async-task",

@@ -52,3 +52,12 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# ── 本地补丁：wstd 反应器空转（V24）─────────────────────────────
+# 上游 0.6.8（当前最新）在 `check_pollables` 里唤醒 pollable 后**不注销** waitee，
+# 只靠 `WaitFor::drop` 注销。当某个任务的 waitee 成为孤儿、而该 pollable 永久就绪时，
+# `block_on` 会 `poll()` 立即返回 → `pop_ready_list()` 恒 None → 死循环烧核（V24 现场采样
+# 100% 落在 host `wasi:io/poll`）。补丁把唤醒改为边沿语义（唤醒即摘除）。
+# 依据与原始采样见 docs/issue-board.md §4.5 与 docs/findings/v24-reactor-spin.md。
+[patch.crates-io]
+wstd = { path = "vendor/wstd" }

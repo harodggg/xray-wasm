@@ -48,3 +48,6 @@
 /.e2e-vision-client.json
 /.e2e-vision-empty.log
 /.e2e-vision-empty.json
+
+# 调查脚本产生的 Python 字节码
+scripts/__pycache__/

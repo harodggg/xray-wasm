@@ -64,7 +64,18 @@ pub async fn timeout<F: Future>(
 ) -> std::result::Result<F::Output, Elapsed> {
     let timer = wstd::time::Timer::after(wstd::time::Duration::from(dur));
     let wait = timer.wait();
-    match futures::future::select(Box::pin(future), Box::pin(wait)).await {
+    // V24 诊断：`timeout()` 的等待**不经过** `Ready`，也不计入任何既有计数。
+    // 空转时任务级心跳会被饿死，所以这里自己打印（每 200k 次一行）。
+    let mut sel = Box::pin(futures::future::select(Box::pin(future), Box::pin(wait)));
+    let polled = futures::future::poll_fn(move |cx| {
+        let n = TIMEOUT_POLLS.fetch_add(1, ORD) + 1;
+        if n % 200_000 == 0 && diag_on() {
+            eprintln!("[v24diag-timeout] polls={n}");
+        }
+        sel.as_mut().poll(cx)
+    })
+    .await;
+    match polled {
         futures::future::Either::Left((value, _)) => Ok(value),
         // 超时分支：右侧的输出类型不用关心（wstd 的 Wait 返回 Instant）。
         futures::future::Either::Right((_, _)) => Err(Elapsed),
@@ -79,16 +90,156 @@ fn wasi_err(e: impl std::fmt::Debug) -> io::Error {
 ///
 /// 做法与 `wstd` 内部 `AsyncInputStream::poll_ready` 一致：把 pollable 的 waker
 /// 注册到当前任务，就绪时由 reactor 唤醒。
-/// 诊断用：存活中的 `WaitFor` 注册数、以及创建过的 `AsyncPollable` 数。
 ///
-/// 目的只有一个：挂起期间这个数是不是**单调增长不回落**。
-/// 若是，就是 waker 注册泄漏 —— reactor 里留着失效 waker，
-/// `poll_oneoff` 每轮立刻返回 ⇒ 忙等（V24 的自旋）。
+/// # V24 诊断计数（`XT_DIAG=1` 才打印，默认零输出）
+///
+/// ⚠️ **每个计数的名字必须和它所在的分支一起核对** —— V24 六续就是因为探针
+/// 打在 `Poll::Pending` 分支、名字却写成 `ready_got_READY`，把结论整个弄反了。
+/// 所以下面每个 `fetch_add` 都紧挨着它所属的 `return / continue`。
 static LIVE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MADE_POLLABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static READY_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `Ready::poll` 的两个出口（互斥、合计 = `READY_POLLS`）。
+static READY_READY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READY_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `WaitFor` 被新建的次数（复用时不增）。与 `live_waits` 一起看泄漏。
+static WAITFOR_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `NetStream::poll_read` 的三个出口。
+static READ_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_DATA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const ORD: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
+
+/// 其余候选热路径（V24：要一次跑出「到底哪个计数在涨」）。
+static WRITE_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_WOULDBLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLUSH_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LISTENER_ACCEPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONNECT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONNECT_WAITS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONNECT_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static YIELD_NOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_HEARTBEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `sleep()` 被调用次数 / **没睡够就返回**的次数（定时器被"一次就绪后恒就绪"污染）。
+static SLEEP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SLEEP_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// V24 诊断：`timeout()` 里那个 `select` 被轮询的次数（不计入任何既有计数）。
+static TIMEOUT_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn diag_on() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(ORD) {
+        2 => {
+            let v = if std::env::var_os("XT_DIAG").is_some() {
+                1
+            } else {
+                0
+            };
+            ON.store(v, ORD);
+            v == 1
+        }
+        v => v == 1,
+    }
+}
+
+/// V24 诊断心跳：每 `--interval` 秒打印**本区间增量**（速率）与瞬时快照。
+///
+/// 用增量而不是累计值，是因为判据问的是「每秒多少次」：
+/// * `read_top/s` ≈ 20,000 且 `read_pending/s` 相等 ⇒ 读等待被高频重轮询；
+/// * `ready_ready/s > 0` 而 `read_data/s == 0` ⇒ pollable **反复被判就绪**但没数据；
+/// * `live_waits` 单调增长 ⇒ WaitFor 注册泄漏（reactor 里留失效 waker）。
+fn diag_watchdog() {
+    static STARTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    if STARTED.swap(1, ORD) == 0 {
+        spawn_task(async {
+            let snap = || {
+                [
+                    READ_TOP.load(ORD),
+                    READ_PENDING.load(ORD),
+                    READ_EMPTY.load(ORD),
+                    READ_DATA.load(ORD),
+                    READY_POLLS.load(ORD),
+                    READY_READY.load(ORD),
+                    READY_PENDING.load(ORD),
+                    WAITFOR_CREATED.load(ORD),
+                    WRITE_ENTRIES.load(ORD),
+                    WRITE_WOULDBLOCK.load(ORD),
+                    FLUSH_ENTRIES.load(ORD),
+                    LISTENER_ACCEPTS.load(ORD),
+                    CONNECT_ATTEMPTS.load(ORD),
+                    CONNECT_WAITS_DONE.load(ORD),
+                    CONNECT_TIMEOUTS.load(ORD),
+                    YIELD_NOWS.load(ORD),
+                    SLEEP_CALLS.load(ORD),
+                    SLEEP_EARLY.load(ORD),
+                ]
+            };
+            let mut prev = snap();
+            let names = [
+                "read_top",
+                "read_pend",
+                "read_empty",
+                "read_data",
+                "ready_poll",
+                "ready_ready",
+                "ready_pend",
+                "waitfor_new",
+                "write",
+                "write_wb",
+                "flush",
+                "accept",
+                "conn_att",
+                "conn_wait",
+                "conn_to",
+                "yield",
+                "sleep",
+                "sleep_early",
+            ];
+            let mut t_prev = std::time::Instant::now();
+            loop {
+                sleep(Duration::from_millis(500)).await;
+                let now = snap();
+                let dt = t_prev.elapsed().as_secs_f64();
+                let mut line = String::new();
+                for i in 0..names.len() {
+                    if i > 0 {
+                        line.push(' ');
+                    }
+                    line.push_str(&format!(
+                        "{}={}",
+                        names[i],
+                        ((now[i] - prev[i]) as f64 / dt) as u64
+                    ));
+                }
+                diag_t0(); // 保证 T0 在第一次心跳前就初始化（否则首行 t+ 恒为 0）
+                eprintln!(
+                    "[v24wd #{:>3} t+{:>7.3}s Δ{:.2}s] {} | live_waits={} pollables={}",
+                    DIAG_HEARTBEATS.fetch_add(1, ORD) + 1,
+                    diag_t0().elapsed().as_secs_f64(),
+                    dt,
+                    line,
+                    LIVE_WAITS.load(ORD),
+                    MADE_POLLABLES.load(ORD),
+                );
+                prev = now;
+                t_prev = std::time::Instant::now();
+            }
+        });
+    }
+}
+
+fn diag_t0() -> &'static std::time::Instant {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+}
+
 /// 给 `WaitFor` 包一层，好在它真的被 Drop 时把存活数减回去。
+// V24 诊断用（当前只保留定义与 Drop 计数，未接入；加 allow 以免 clippy -D warnings 变红）。
+#[allow(dead_code)]
 struct CountedWait(Pin<Box<WaitFor>>);
 
 impl std::ops::Deref for CountedWait {
@@ -109,15 +260,31 @@ impl Drop for CountedWait {
 }
 
 struct Ready {
+    /// V24 诊断用标签：`read` / `write`。
+    tag: &'static str,
     pollable: OnceLock<AsyncPollable>,
     wait: Mutex<Option<Pin<Box<WaitFor>>>>,
+    /// V24 兜底（见 `READY_FUTILE_LIMIT`）：连续「被唤醒但 `ready()` 说不就绪」的次数。
+    futile: std::sync::atomic::AtomicU32,
 }
 
+/// V24 兜底阈值：连续这么多次「host 的 `poll()` 说就绪、而 `pollable.ready()` 说不就绪」
+/// 之后，**放行去做真正的 syscall**。
+///
+/// 依据（`docs/findings/v24-reactor-spin.md` §8）：对端批量关闭连接时，某些读 pollable 在
+/// `wasi:io/poll::poll()` 里**永久就绪**（EOF/错误），而 `pollable.ready()` 恒返回 false。
+/// 于是 `Ready::poll` 每次被唤醒都返回 `Pending` 并重新注册 waker ⇒ `block_on` 永不阻塞、
+/// 以 ~21k–35k 次/秒空转，把同进程的其它任务全部饿死（诊断心跳实测被饿到只剩 1 行）。
+/// 放行后由 `read()`/`write()` 的返回值（数据 / EOF / 错误）裁定，不再由就绪探测裁定。
+const READY_FUTILE_LIMIT: u32 = 8;
+
 impl Ready {
-    fn new() -> Self {
+    fn new(tag: &'static str) -> Self {
         Self {
+            tag,
             pollable: OnceLock::new(),
             wait: Mutex::new(None),
+            futile: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -127,16 +294,51 @@ impl Ready {
         cx: &mut Context<'_>,
     ) -> Poll<()> {
         // pollable 只订阅一次：每次 subscribe 都会新建一个子资源。
-        let pollable = self
-            .pollable
-            .get_or_init(|| AsyncPollable::new(subscribe()));
+        let pollable = self.pollable.get_or_init(|| {
+            MADE_POLLABLES.fetch_add(1, ORD);
+            AsyncPollable::new(subscribe())
+        });
         let mut slot = self.wait.lock().unwrap();
-        let wait = slot.get_or_insert_with(|| Box::pin(pollable.wait_for()));
-        match wait.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
+        let wait = slot.get_or_insert_with(|| {
+            WAITFOR_CREATED.fetch_add(1, ORD);
+            LIVE_WAITS.fetch_add(1, ORD);
+            Box::pin(pollable.wait_for())
+        });
+        // 先取结果，再决定动作：`slot.take()` 需要 `slot` 的可变借用已结束。
+        let polled = wait.as_mut().poll(cx);
+        match polled {
+            // 标签与分支一起核对：这一支就是「就绪探测说不就绪」。
+            Poll::Pending => {
+                READY_PENDING.fetch_add(1, ORD);
+                let n = READY_POLLS.fetch_add(1, ORD) + 1;
+                // V24 诊断：空转时心跳任务会被饿死，这里自己打印（每 200k 次一行）。
+                if n % 200_000 == 0 && diag_on() {
+                    eprintln!("[v24diag-ready] tag={} polls={n}", self.tag);
+                }
+                // V24 兜底：宿主 `poll()` 反复报就绪而 `ready()` 反复说不就绪 ⇒ 放行。
+                if self.futile.fetch_add(1, ORD) + 1 >= READY_FUTILE_LIMIT {
+                    self.futile.store(0, ORD);
+                    if slot.take().is_some() {
+                        LIVE_WAITS.fetch_sub(1, ORD);
+                    }
+                    if diag_on() {
+                        eprintln!(
+                            "[v24diag-ready] tag={} 放行（宿主 poll 与 ready 不一致）",
+                            self.tag
+                        );
+                    }
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            }
             // 就绪后必须丢弃这个 WaitFor，否则它的 Drop 会去注销已失效的 waker。
             Poll::Ready(()) => {
-                let _ = slot.take();
+                READY_READY.fetch_add(1, ORD);
+                READY_POLLS.fetch_add(1, ORD);
+                self.futile.store(0, ORD);
+                if slot.take().is_some() {
+                    LIVE_WAITS.fetch_sub(1, ORD);
+                }
                 Poll::Ready(())
             }
         }
@@ -158,8 +360,8 @@ pub struct NetStream {
 impl NetStream {
     fn new(input: InputStream, output: OutputStream, socket: TcpSocket) -> Self {
         Self {
-            read_ready: Ready::new(),
-            write_ready: Ready::new(),
+            read_ready: Ready::new("read"),
+            write_ready: Ready::new("write"),
             input,
             output,
             socket,
@@ -203,18 +405,43 @@ impl AsyncRead for NetStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if diag_on() {
+            diag_watchdog();
+        }
+        // V24：单次 `poll_read` 调用里的循环次数。若涨到几万，说明
+        // `Ok(empty) => continue` 在**一次 poll 内**空转 —— 它不产生 await 点，
+        // 会把整个 reactor 饿死（连 500ms 心跳都停）。
+        let mut iters: u64 = 0;
         loop {
+            iters += 1;
+            READ_TOP.fetch_add(1, ORD);
             if this
                 .read_ready
                 .poll(&|| this.input.subscribe(), cx)
                 .is_pending()
             {
+                // 标签与分支一起核对：这一支就是 `poll_read` 返回 Pending。
+                READ_PENDING.fetch_add(1, ORD);
                 return Poll::Pending;
             }
             match this.input.read(buf.remaining() as u64) {
                 // WASI 里读到 0 字节**不是** EOF（就绪不代表有数据），重试。
-                Ok(chunk) if chunk.is_empty() => continue,
+                Ok(chunk) if chunk.is_empty() => {
+                    // 就绪为真但读不到数据：这一支就是 V24 说的「空读」。
+                    READ_EMPTY.fetch_add(1, ORD);
+                    if diag_on() && iters % 10_000 == 0 {
+                        eprintln!(
+                            "[v24spin] 单次 poll_read 内已空读 {iters} 次仍未返回 \
+                             （read_empty={} read_data={} live_waits={}）",
+                            READ_EMPTY.load(ORD),
+                            READ_DATA.load(ORD),
+                            LIVE_WAITS.load(ORD),
+                        );
+                    }
+                    continue;
+                }
                 Ok(chunk) => {
+                    READ_DATA.fetch_add(1, ORD);
                     buf.put_slice(&chunk);
                     return Poll::Ready(Ok(()));
                 }
@@ -233,9 +460,11 @@ impl AsyncWrite for NetStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        WRITE_ENTRIES.fetch_add(1, ORD);
         match this.output.check_write() {
             // 0 表示当前写不进去：注册就绪后挂起，不空转。
             Ok(0) => {
+                WRITE_WOULDBLOCK.fetch_add(1, ORD);
                 if this
                     .write_ready
                     .poll(&|| this.output.subscribe(), cx)
@@ -264,6 +493,7 @@ impl AsyncWrite for NetStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        FLUSH_ENTRIES.fetch_add(1, ORD);
         if let Err(e) = this.output.flush() {
             return Poll::Ready(Err(wasi_err(e)));
         }
@@ -289,6 +519,7 @@ impl AsyncWrite for NetStream {
 /// 用 0 时长定时器实现：它会注册一个 pollable。不能简单地返回一次 `Pending` ——
 /// wstd 的 reactor 在「有任务挂起但没有任何待决 pollable」时会 panic。
 pub async fn yield_now() {
+    YIELD_NOWS.fetch_add(1, ORD);
     wstd::time::Timer::after(wstd::time::Duration::from_millis(0))
         .wait()
         .await;
@@ -298,9 +529,15 @@ pub async fn yield_now() {
 ///
 /// 用 WASI 单调时钟定时器，到点由 reactor 唤醒 —— 不占用 CPU。
 pub async fn sleep(dur: Duration) {
+    let t0 = std::time::Instant::now();
     wstd::time::Timer::after(wstd::time::Duration::from(dur))
         .wait()
         .await;
+    SLEEP_CALLS.fetch_add(1, ORD);
+    // 没睡够一半就算「定时器没生效」：V24 的自旋如果是这个，这里会涨到几万/秒。
+    if t0.elapsed() < dur / 2 {
+        SLEEP_EARLY.fetch_add(1, ORD);
+    }
 }
 
 /// 监听套接字。
@@ -323,7 +560,8 @@ impl NetListener {
     ///
     /// `accept` 本身是同步的（非阻塞），所以先等 pollable 就绪，再调用它。
     pub async fn accept(&self) -> io::Result<NetStream> {
-        self.pollable.wait_for().await;
+        bare_wait(0, &self.pollable).await;
+        LISTENER_ACCEPTS.fetch_add(1, ORD);
         let (socket, input, output) = self.socket.accept().map_err(wasi_err)?;
         Ok(NetStream::new(input, output, socket))
     }
@@ -448,6 +686,7 @@ pub async fn connect(addr: &str) -> io::Result<NetStream> {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => last_err = Some(e),
             Err(_) => {
+                CONNECT_TIMEOUTS.fetch_add(1, ORD);
                 last_err = Some(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("连接 {sa} 超过 {} 秒未完成", budget.as_secs()),
@@ -479,6 +718,25 @@ pub async fn connect(addr: &str) -> io::Result<NetStream> {
     })
 }
 
+/// 裸 `WaitFor`（不经 `Ready`，因此**不计入** `READY_POLLS`）的重轮询计数：V24 诊断。
+///
+/// 空转时任务级心跳会被饿死（实测 18s 窗口只打到 1 行），所以这里用
+/// 「每 100k 次自己打一行」的方式保证**仍然可见** —— 打印发生在空转循环内部。
+static BARE_WAITS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const BARE_WAIT_NAMES: [&str; 3] = ["accept", "connect", "listen"];
+
+async fn bare_wait(idx: usize, pollable: &AsyncPollable) {
+    let n = BARE_WAITS[idx].fetch_add(1, ORD) + 1;
+    if n % 100_000 == 0 && diag_on() {
+        eprintln!("[v24diag-bare] {} polls={}", BARE_WAIT_NAMES[idx], n);
+    }
+    pollable.wait_for().await;
+}
+
 /// 连到一个已解析的地址。
 async fn connect_addr(sa: std::net::SocketAddr) -> io::Result<NetStream> {
     let socket =
@@ -488,7 +746,10 @@ async fn connect_addr(sa: std::net::SocketAddr) -> io::Result<NetStream> {
     socket
         .start_connect(&network, to_wasi_addr(sa))
         .map_err(wasi_err)?;
-    AsyncPollable::new(socket.subscribe()).wait_for().await;
+    CONNECT_ATTEMPTS.fetch_add(1, ORD);
+    let cp = AsyncPollable::new(socket.subscribe());
+    bare_wait(1, &cp).await;
+    CONNECT_WAITS_DONE.fetch_add(1, ORD);
     let (input, output) = socket.finish_connect().map_err(wasi_err)?;
 
     Ok(NetStream::new(input, output, socket))
@@ -508,11 +769,11 @@ pub async fn listen(addr: &str) -> io::Result<NetListener> {
         .start_bind(&network, to_wasi_addr(sa))
         .map_err(wasi_err)?;
     let pollable = AsyncPollable::new(socket.subscribe());
-    pollable.wait_for().await;
+    bare_wait(2, &pollable).await;
     socket.finish_bind().map_err(wasi_err)?;
 
     socket.start_listen().map_err(wasi_err)?;
-    pollable.wait_for().await;
+    bare_wait(2, &pollable).await;
     socket.finish_listen().map_err(wasi_err)?;
 
     Ok(NetListener { pollable, socket })
